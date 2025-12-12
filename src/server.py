@@ -1,0 +1,500 @@
+"""
+WebSocket Server
+
+Real-time server for the arbitrage trading terminal.
+Handles market data streaming, trade execution, and wallet connections.
+"""
+
+import asyncio
+import json
+import logging
+import os
+from typing import Dict, List, Optional, Any
+from datetime import datetime, timedelta
+from dataclasses import asdict
+
+from flask import Flask, render_template, request, jsonify, send_from_directory
+from flask_cors import CORS
+from flask_socketio import SocketIO, emit, join_room, leave_room
+
+from .api.kalshi_client import KalshiClient
+from .api.polymarket_client import PolymarketClient
+from .core.market_matcher import MarketMatcher, MatchedMarket
+from .core.arbitrage_detector import ArbitrageDetector, ArbitrageOpportunity
+from .core.trade_executor import TradeExecutor, ArbitrageTrade
+from .utils.config import Config
+from .utils.logger import setup_logging
+
+logger = logging.getLogger(__name__)
+
+
+class ArbitrageServer:
+    """
+    Main server class for the arbitrage trading application
+
+    Provides:
+    - REST API for market data and trading
+    - WebSocket for real-time updates
+    - Static file serving for frontend
+    """
+
+    def __init__(self, config: Optional[Config] = None):
+        """
+        Initialize the server
+
+        Args:
+            config: Configuration object
+        """
+        self.config = config or Config.from_env()
+
+        # Initialize Flask app
+        self.app = Flask(
+            __name__,
+            static_folder='../frontend',
+            template_folder='../frontend'
+        )
+        CORS(self.app)
+
+        # Initialize SocketIO
+        self.socketio = SocketIO(
+            self.app,
+            cors_allowed_origins="*",
+            async_mode='eventlet',
+            logger=False,
+            engineio_logger=False
+        )
+
+        # Initialize components
+        self.kalshi_client: Optional[KalshiClient] = None
+        self.polymarket_client: Optional[PolymarketClient] = None
+        self.matcher = MarketMatcher(fuzzy_threshold=65)
+        self.detector = ArbitrageDetector(
+            min_profit_pct=self.config.trading.min_profit_pct
+        )
+        self.executor = TradeExecutor(
+            max_trade_size=self.config.trading.max_trade_size,
+            dry_run=self.config.trading.dry_run
+        )
+
+        # State
+        self.matched_markets: List[MatchedMarket] = []
+        self.opportunities: List[ArbitrageOpportunity] = []
+        self.connected_wallets: Dict[str, Dict] = {}
+        self.last_update: Optional[datetime] = None
+        self.is_scanning = False
+
+        # Setup routes
+        self._setup_routes()
+        self._setup_socketio()
+
+    def _setup_routes(self):
+        """Setup HTTP routes"""
+
+        @self.app.route('/')
+        def index():
+            """Serve main terminal interface"""
+            return send_from_directory(self.app.static_folder, 'index.html')
+
+        @self.app.route('/css/<path:filename>')
+        def css(filename):
+            """Serve CSS files"""
+            return send_from_directory(
+                os.path.join(self.app.static_folder, 'css'),
+                filename
+            )
+
+        @self.app.route('/js/<path:filename>')
+        def js(filename):
+            """Serve JavaScript files"""
+            return send_from_directory(
+                os.path.join(self.app.static_folder, 'js'),
+                filename
+            )
+
+        @self.app.route('/api/status')
+        def status():
+            """Get server status"""
+            return jsonify({
+                "status": "online",
+                "version": "1.0.0",
+                "config": self.config.to_dict(),
+                "last_update": self.last_update.isoformat() if self.last_update else None,
+                "is_scanning": self.is_scanning,
+                "matched_markets": len(self.matched_markets),
+                "opportunities": len(self.opportunities),
+                "connected_wallets": len(self.connected_wallets)
+            })
+
+        @self.app.route('/api/markets')
+        def get_markets():
+            """Get matched markets"""
+            return jsonify({
+                "markets": [m.to_dict() for m in self.matched_markets],
+                "count": len(self.matched_markets),
+                "last_update": self.last_update.isoformat() if self.last_update else None
+            })
+
+        @self.app.route('/api/opportunities')
+        def get_opportunities():
+            """Get arbitrage opportunities"""
+            min_profit = request.args.get('min_profit', type=float)
+            max_risk = request.args.get('max_risk', type=float)
+
+            opps = self.detector.get_opportunities(
+                min_profit=min_profit,
+                max_risk=max_risk
+            )
+
+            return jsonify({
+                "opportunities": [o.to_dict() for o in opps],
+                "count": len(opps),
+                "stats": self.detector.get_stats()
+            })
+
+        @self.app.route('/api/trades')
+        def get_trades():
+            """Get trade history"""
+            limit = request.args.get('limit', 50, type=int)
+            trades = self.executor.get_recent_trades(limit)
+
+            return jsonify({
+                "trades": [t.to_dict() for t in trades],
+                "count": len(trades),
+                "stats": self.executor.get_stats()
+            })
+
+        @self.app.route('/api/execute', methods=['POST'])
+        def execute_trade():
+            """Execute an arbitrage opportunity"""
+            data = request.json
+            opp_id = data.get('opportunity_id')
+            size = data.get('size_usd')
+
+            opp = self.detector.get_opportunity(opp_id)
+            if not opp:
+                return jsonify({"error": "Opportunity not found"}), 404
+
+            # Execute in background
+            asyncio.run(self._execute_opportunity(opp, size))
+
+            return jsonify({"status": "executing", "opportunity_id": opp_id})
+
+        @self.app.route('/api/scan', methods=['POST'])
+        def trigger_scan():
+            """Trigger a market scan"""
+            if self.is_scanning:
+                return jsonify({"error": "Scan already in progress"}), 409
+
+            # Run scan in background
+            self.socketio.start_background_task(self._run_scan)
+
+            return jsonify({"status": "scanning"})
+
+    def _setup_socketio(self):
+        """Setup WebSocket event handlers"""
+
+        @self.socketio.on('connect')
+        def handle_connect():
+            """Handle client connection"""
+            logger.info(f"Client connected: {request.sid}")
+            emit('connected', {
+                'status': 'connected',
+                'session_id': request.sid,
+                'server_time': datetime.utcnow().isoformat()
+            })
+
+        @self.socketio.on('disconnect')
+        def handle_disconnect():
+            """Handle client disconnection"""
+            logger.info(f"Client disconnected: {request.sid}")
+            # Remove wallet association
+            for addr, data in list(self.connected_wallets.items()):
+                if data.get('session_id') == request.sid:
+                    del self.connected_wallets[addr]
+
+        @self.socketio.on('wallet_connect')
+        def handle_wallet_connect(data):
+            """Handle wallet connection from frontend"""
+            address = data.get('address')
+            chain_id = data.get('chainId')
+            platform = data.get('platform')  # 'kalshi' or 'polymarket'
+
+            if not address:
+                emit('wallet_error', {'error': 'No address provided'})
+                return
+
+            self.connected_wallets[address] = {
+                'session_id': request.sid,
+                'chain_id': chain_id,
+                'platform': platform,
+                'connected_at': datetime.utcnow().isoformat()
+            }
+
+            logger.info(f"Wallet connected: {address} ({platform})")
+
+            emit('wallet_connected', {
+                'address': address,
+                'platform': platform,
+                'chain_id': chain_id
+            })
+
+            # Broadcast to all clients
+            self.socketio.emit('wallet_status', {
+                'connected_wallets': len(self.connected_wallets)
+            })
+
+        @self.socketio.on('wallet_disconnect')
+        def handle_wallet_disconnect(data):
+            """Handle wallet disconnection"""
+            address = data.get('address')
+            if address in self.connected_wallets:
+                del self.connected_wallets[address]
+                logger.info(f"Wallet disconnected: {address}")
+
+            emit('wallet_disconnected', {'address': address})
+
+        @self.socketio.on('subscribe_markets')
+        def handle_subscribe_markets():
+            """Subscribe to market updates"""
+            join_room('markets')
+            emit('subscribed', {'channel': 'markets'})
+
+            # Send current data
+            emit('markets_update', {
+                'markets': [m.to_dict() for m in self.matched_markets[-20:]],
+                'count': len(self.matched_markets)
+            })
+
+        @self.socketio.on('subscribe_opportunities')
+        def handle_subscribe_opportunities():
+            """Subscribe to arbitrage opportunity updates"""
+            join_room('opportunities')
+            emit('subscribed', {'channel': 'opportunities'})
+
+            # Send current opportunities
+            opps = self.detector.get_opportunities()[:20]
+            emit('opportunities_update', {
+                'opportunities': [o.to_dict() for o in opps],
+                'count': len(self.opportunities),
+                'stats': self.detector.get_stats()
+            })
+
+        @self.socketio.on('subscribe_trades')
+        def handle_subscribe_trades():
+            """Subscribe to trade updates"""
+            join_room('trades')
+            emit('subscribed', {'channel': 'trades'})
+
+        @self.socketio.on('execute_opportunity')
+        def handle_execute(data):
+            """Execute arbitrage opportunity via WebSocket"""
+            opp_id = data.get('opportunity_id')
+            size = data.get('size_usd', self.config.trading.max_trade_size)
+
+            opp = self.detector.get_opportunity(opp_id)
+            if not opp:
+                emit('execution_error', {'error': 'Opportunity not found'})
+                return
+
+            emit('execution_started', {
+                'opportunity_id': opp_id,
+                'status': 'executing'
+            })
+
+            # Execute in background
+            self.socketio.start_background_task(
+                self._execute_opportunity_async,
+                opp,
+                size
+            )
+
+        @self.socketio.on('start_scan')
+        def handle_start_scan():
+            """Start market scan"""
+            if self.is_scanning:
+                emit('scan_error', {'error': 'Scan already in progress'})
+                return
+
+            emit('scan_started', {'status': 'scanning'})
+            self.socketio.start_background_task(self._run_scan)
+
+    async def _execute_opportunity(self, opp: ArbitrageOpportunity, size: float):
+        """Execute opportunity and broadcast results"""
+        trade = await self.executor.execute_opportunity(opp, size)
+
+        # Broadcast trade result
+        self.socketio.emit('trade_executed', {
+            'trade': trade.to_dict()
+        }, room='trades')
+
+        return trade
+
+    def _execute_opportunity_async(self, opp: ArbitrageOpportunity, size: float):
+        """Background task wrapper for opportunity execution"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        try:
+            trade = loop.run_until_complete(
+                self._execute_opportunity(opp, size)
+            )
+
+            self.socketio.emit('execution_completed', {
+                'trade': trade.to_dict(),
+                'stats': self.executor.get_stats()
+            })
+
+        except Exception as e:
+            logger.error(f"Execution error: {e}")
+            self.socketio.emit('execution_error', {
+                'error': str(e),
+                'opportunity_id': opp.id
+            })
+        finally:
+            loop.close()
+
+    def _run_scan(self):
+        """Background task for market scanning"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        try:
+            self.is_scanning = True
+            self.socketio.emit('scan_progress', {
+                'stage': 'starting',
+                'progress': 0
+            })
+
+            loop.run_until_complete(self._scan_markets())
+
+        except Exception as e:
+            logger.error(f"Scan error: {e}")
+            self.socketio.emit('scan_error', {'error': str(e)})
+        finally:
+            self.is_scanning = False
+            loop.close()
+
+    async def _scan_markets(self):
+        """Scan markets for arbitrage opportunities"""
+        logger.info("Starting market scan...")
+
+        # Initialize clients if needed
+        if not self.kalshi_client:
+            self.kalshi_client = KalshiClient(
+                api_key=self.config.kalshi.api_key,
+                api_secret=self.config.kalshi.api_secret,
+                demo_mode=self.config.kalshi.demo_mode
+            )
+            await self.kalshi_client.connect()
+
+        if not self.polymarket_client:
+            self.polymarket_client = PolymarketClient(
+                private_key=self.config.polymarket.private_key,
+                web3_provider=self.config.web3.provider_url
+            )
+            await self.polymarket_client.connect()
+
+        # Update executor with clients
+        self.executor.kalshi = self.kalshi_client
+        self.executor.polymarket = self.polymarket_client
+
+        try:
+            # Fetch Kalshi markets
+            self.socketio.emit('scan_progress', {
+                'stage': 'fetching_kalshi',
+                'progress': 10,
+                'message': 'Fetching Kalshi markets...'
+            })
+
+            kalshi_markets = await self.kalshi_client.get_all_markets()
+            logger.info(f"Fetched {len(kalshi_markets)} Kalshi markets")
+
+            # Fetch Polymarket markets
+            self.socketio.emit('scan_progress', {
+                'stage': 'fetching_polymarket',
+                'progress': 30,
+                'message': 'Fetching Polymarket markets...'
+            })
+
+            poly_markets = await self.polymarket_client.get_all_markets()
+            logger.info(f"Fetched {len(poly_markets)} Polymarket markets")
+
+            # Match markets
+            self.socketio.emit('scan_progress', {
+                'stage': 'matching',
+                'progress': 60,
+                'message': 'Matching markets...'
+            })
+
+            self.matched_markets = self.matcher.match_markets(
+                kalshi_markets,
+                poly_markets
+            )
+            logger.info(f"Found {len(self.matched_markets)} matched markets")
+
+            # Detect arbitrage
+            self.socketio.emit('scan_progress', {
+                'stage': 'detecting',
+                'progress': 80,
+                'message': 'Detecting arbitrage opportunities...'
+            })
+
+            self.detector.clear_opportunities()
+            self.opportunities = self.detector.scan_all(self.matched_markets)
+            logger.info(f"Found {len(self.opportunities)} arbitrage opportunities")
+
+            self.last_update = datetime.utcnow()
+
+            # Broadcast updates
+            self.socketio.emit('scan_progress', {
+                'stage': 'complete',
+                'progress': 100,
+                'message': 'Scan complete'
+            })
+
+            self.socketio.emit('markets_update', {
+                'markets': [m.to_dict() for m in self.matched_markets[:50]],
+                'count': len(self.matched_markets)
+            }, room='markets')
+
+            self.socketio.emit('opportunities_update', {
+                'opportunities': [o.to_dict() for o in self.opportunities[:50]],
+                'count': len(self.opportunities),
+                'stats': self.detector.get_stats()
+            }, room='opportunities')
+
+            self.socketio.emit('scan_complete', {
+                'matched_markets': len(self.matched_markets),
+                'opportunities': len(self.opportunities),
+                'profitable': len([o for o in self.opportunities if o.is_profitable]),
+                'last_update': self.last_update.isoformat()
+            })
+
+        except Exception as e:
+            logger.error(f"Scan error: {e}")
+            raise
+
+    def run(self):
+        """Start the server"""
+        setup_logging(self.config.log_level, self.config.log_file)
+
+        logger.info(f"Starting Arbitrage Server on {self.config.server.host}:{self.config.server.port}")
+        logger.info(f"Dry run mode: {self.config.trading.dry_run}")
+
+        self.socketio.run(
+            self.app,
+            host=self.config.server.host,
+            port=self.config.server.port,
+            debug=self.config.server.debug
+        )
+
+
+def create_app(config: Optional[Config] = None) -> Flask:
+    """Create Flask app instance"""
+    server = ArbitrageServer(config)
+    return server.app
+
+
+if __name__ == "__main__":
+    server = ArbitrageServer()
+    server.run()
