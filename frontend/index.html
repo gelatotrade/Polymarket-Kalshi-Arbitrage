@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Polymarket-Kalshi Arbitrage Terminal</title>
+    <link rel="stylesheet" href="css/terminal.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.socket.io/4.6.0/socket.io.min.js"></script>
+    <script src="https://cdn.ethers.io/lib/ethers-5.7.umd.min.js"></script>
+</head>
+<body>
+    <div class="terminal-container">
+        <!-- Header Bar -->
+        <header class="terminal-header">
+            <div class="header-left">
+                <div class="window-controls">
+                    <span class="control close"></span>
+                    <span class="control minimize"></span>
+                    <span class="control maximize"></span>
+                </div>
+                <span class="terminal-title">Polymarket-Kalshi Arbitrage Terminal v1.0.0</span>
+            </div>
+            <div class="header-center">
+                <span class="status-indicator" id="connectionStatus">
+                    <span class="status-dot"></span>
+                    <span class="status-text">Connecting...</span>
+                </span>
+            </div>
+            <div class="header-right">
+                <span class="timestamp" id="currentTime"></span>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="terminal-main">
+            <!-- Left Panel - Markets & Opportunities -->
+            <section class="panel panel-left">
+                <!-- Wallet Connection -->
+                <div class="panel-section wallet-section">
+                    <div class="section-header">
+                        <span class="section-icon">&#x1F4B3;</span>
+                        <span class="section-title">WALLET CONNECTION</span>
+                    </div>
+                    <div class="wallet-container">
+                        <div class="wallet-status" id="kalshiWallet">
+                            <span class="platform-label">KALSHI</span>
+                            <button class="connect-btn" id="connectKalshi" onclick="connectKalshiWallet()">
+                                Connect Account
+                            </button>
+                            <span class="wallet-address" id="kalshiAddress"></span>
+                        </div>
+                        <div class="wallet-status" id="polymarketWallet">
+                            <span class="platform-label">POLYMARKET</span>
+                            <button class="connect-btn" id="connectPolymarket" onclick="connectWeb3Wallet()">
+                                Connect Wallet
+                            </button>
+                            <span class="wallet-address" id="polymarketAddress"></span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Scan Controls -->
+                <div class="panel-section controls-section">
+                    <div class="section-header">
+                        <span class="section-icon">&#x1F50D;</span>
+                        <span class="section-title">SCANNER CONTROLS</span>
+                    </div>
+                    <div class="controls-container">
+                        <button class="action-btn primary" id="scanBtn" onclick="startScan()">
+                            <span class="btn-icon">&#x25B6;</span> Start Scan
+                        </button>
+                        <button class="action-btn" onclick="refreshData()">
+                            <span class="btn-icon">&#x21BB;</span> Refresh
+                        </button>
+                        <div class="scan-progress" id="scanProgress">
+                            <div class="progress-bar">
+                                <div class="progress-fill" id="progressFill"></div>
+                            </div>
+                            <span class="progress-text" id="progressText">Ready</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Matched Markets -->
+                <div class="panel-section markets-section">
+                    <div class="section-header">
+                        <span class="section-icon">&#x1F4CA;</span>
+                        <span class="section-title">MATCHED MARKETS</span>
+                        <span class="count-badge" id="marketsCount">0</span>
+                    </div>
+                    <div class="data-table-container" id="marketsTable">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>MARKET</th>
+                                    <th>KALSHI</th>
+                                    <th>POLY</th>
+                                    <th>SPREAD</th>
+                                </tr>
+                            </thead>
+                            <tbody id="marketsBody">
+                                <tr class="empty-row">
+                                    <td colspan="4">No markets loaded. Click "Start Scan" to begin.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Center Panel - Arbitrage Opportunities -->
+            <section class="panel panel-center">
+                <div class="panel-section opportunities-section">
+                    <div class="section-header">
+                        <span class="section-icon">&#x1F4B0;</span>
+                        <span class="section-title">ARBITRAGE OPPORTUNITIES</span>
+                        <span class="count-badge profit" id="oppsCount">0</span>
+                    </div>
+                    <div class="filter-bar">
+                        <label>
+                            Min Profit %:
+                            <input type="number" id="minProfitFilter" value="1" step="0.5" min="0">
+                        </label>
+                        <label>
+                            Max Risk:
+                            <input type="number" id="maxRiskFilter" value="50" step="5" min="0" max="100">
+                        </label>
+                        <button class="filter-btn" onclick="applyFilters()">Apply</button>
+                    </div>
+                    <div class="opportunities-container" id="opportunitiesContainer">
+                        <!-- Opportunity cards will be inserted here -->
+                        <div class="empty-state" id="emptyOpps">
+                            <span class="empty-icon">&#x1F50E;</span>
+                            <p>No arbitrage opportunities found yet.</p>
+                            <p class="hint">Start a scan to detect price discrepancies.</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Right Panel - Terminal & Stats -->
+            <section class="panel panel-right">
+                <!-- Stats Dashboard -->
+                <div class="panel-section stats-section">
+                    <div class="section-header">
+                        <span class="section-icon">&#x1F4C8;</span>
+                        <span class="section-title">TRADING STATS</span>
+                    </div>
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <span class="stat-label">Total P&L</span>
+                            <span class="stat-value" id="totalPnl">$0.00</span>
+                        </div>
+                        <div class="stat-card">
+                            <span class="stat-label">Win Rate</span>
+                            <span class="stat-value" id="winRate">0%</span>
+                        </div>
+                        <div class="stat-card">
+                            <span class="stat-label">Trades</span>
+                            <span class="stat-value" id="totalTrades">0</span>
+                        </div>
+                        <div class="stat-card">
+                            <span class="stat-label">Avg Profit</span>
+                            <span class="stat-value" id="avgProfit">0%</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Recent Trades -->
+                <div class="panel-section trades-section">
+                    <div class="section-header">
+                        <span class="section-icon">&#x1F4DD;</span>
+                        <span class="section-title">RECENT TRADES</span>
+                    </div>
+                    <div class="trades-list" id="tradesList">
+                        <div class="empty-state">
+                            <p>No trades executed yet.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Terminal Output -->
+                <div class="panel-section terminal-section">
+                    <div class="section-header">
+                        <span class="section-icon">&#x1F4BB;</span>
+                        <span class="section-title">TERMINAL</span>
+                        <button class="clear-btn" onclick="clearTerminal()">Clear</button>
+                    </div>
+                    <div class="terminal-output" id="terminalOutput">
+                        <div class="terminal-line system">
+                            <span class="timestamp">[--:--:--]</span>
+                            <span class="message">Polymarket-Kalshi Arbitrage Bot initialized.</span>
+                        </div>
+                        <div class="terminal-line system">
+                            <span class="timestamp">[--:--:--]</span>
+                            <span class="message">Connect your wallets and start scanning for opportunities.</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Footer -->
+        <footer class="terminal-footer">
+            <div class="footer-left">
+                <span class="mode-indicator" id="modeIndicator">DRY RUN MODE</span>
+            </div>
+            <div class="footer-center">
+                <span id="lastUpdate">Last update: Never</span>
+            </div>
+            <div class="footer-right">
+                <span class="network-status" id="networkStatus">
+                    <span class="network-dot polygon"></span>
+                    Polygon Mainnet
+                </span>
+            </div>
+        </footer>
+    </div>
+
+    <!-- Trade Confirmation Modal -->
+    <div class="modal" id="tradeModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Confirm Trade Execution</h3>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="modalBody">
+                <!-- Trade details will be inserted here -->
+            </div>
+            <div class="modal-footer">
+                <button class="action-btn cancel" onclick="closeModal()">Cancel</button>
+                <button class="action-btn primary" id="confirmTradeBtn">Execute Trade</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="js/app.js"></script>
+</body>
+</html>
