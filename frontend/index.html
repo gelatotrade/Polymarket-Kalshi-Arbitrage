@@ -144,24 +144,25 @@
                 <div class="panel-section viz-section">
                     <div class="section-header">
                         <span class="section-icon">&#x1F30C;</span>
-                        <span class="section-title">3D ARBITRAGE SURFACE</span>
+                        <span class="section-title">KALSHI vs POLYMARKET LIVE SURFACES</span>
                         <button class="clear-btn" onclick="refreshArbitrageSurface()">Refresh</button>
                     </div>
                     <div class="viz-container">
                         <img id="arbitrageSurfaceGif"
                              class="viz-image"
                              src="/assets/arbitrage_surface.gif"
-                             alt="3D arbitrage surface showing where edges live across Kalshi and Polymarket YES prices">
+                             alt="Two scrolling 3D surfaces showing Kalshi and Polymarket YES prices side by side, with arbitrage gaps highlighted">
                         <div class="viz-legend">
-                            <span class="viz-legend-item"><span class="viz-swatch viz-swatch-loss"></span>loss zone</span>
-                            <span class="viz-legend-item"><span class="viz-swatch viz-swatch-edge"></span>thin edge</span>
-                            <span class="viz-legend-item"><span class="viz-swatch viz-swatch-profit"></span>profit zone</span>
-                            <span class="viz-legend-item"><span class="viz-dot viz-dot-live"></span>live opp.</span>
+                            <span class="viz-legend-item"><span class="viz-swatch viz-swatch-kalshi"></span>Kalshi YES</span>
+                            <span class="viz-legend-item"><span class="viz-swatch viz-swatch-poly"></span>Polymarket YES</span>
+                            <span class="viz-legend-item"><span class="viz-swatch viz-swatch-arb"></span>live arb gap</span>
+                            <span class="viz-legend-item"><span class="viz-dot viz-dot-live"></span>now edge</span>
                         </div>
                         <p class="viz-caption">
-                            X = Kalshi YES &middot; Y = Polymarket YES &middot; Z = net edge (cents) after fees &amp; slippage.
-                            The camera stays fixed and the surface itself deforms: traveling waves along the no-arbitrage
-                            valley plus pulsing activity bumps at every live opportunity make the landscape breathe with the market.
+                            X = matched market &middot; Y = time &rarr; now &middot; Z = YES price.
+                            Two ribbons in one plot: cyan = Kalshi, amber = Polymarket. The vertical gap between them is
+                            the cross-platform arbitrage edge. Surfaces scroll forward in time as live data arrives;
+                            green bars on the now edge mark markets whose spread currently exceeds the actionable threshold.
                         </p>
                     </div>
                 </div>

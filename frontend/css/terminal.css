@@ -927,9 +927,9 @@ body {
     border: 1px solid rgba(255, 255, 255, 0.15);
 }
 
-.viz-swatch-loss { background: linear-gradient(90deg, #1f6feb, #39c5cf); }
-.viz-swatch-edge { background: linear-gradient(90deg, #39c5cf, #d29922); }
-.viz-swatch-profit { background: linear-gradient(90deg, #3fb950, #a371f7); }
+.viz-swatch-kalshi { background: #39c5cf; }
+.viz-swatch-poly   { background: #d29922; }
+.viz-swatch-arb    { background: #3fb950; }
 
 .viz-dot {
     display: inline-block;
