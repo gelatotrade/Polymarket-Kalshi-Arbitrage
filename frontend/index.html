@@ -139,6 +139,31 @@
                         </div>
                     </div>
                 </div>
+
+                <!-- 3D Arbitrage Surface Visualization -->
+                <div class="panel-section viz-section">
+                    <div class="section-header">
+                        <span class="section-icon">&#x1F30C;</span>
+                        <span class="section-title">3D ARBITRAGE SURFACE</span>
+                        <button class="clear-btn" onclick="refreshArbitrageSurface()">Refresh</button>
+                    </div>
+                    <div class="viz-container">
+                        <img id="arbitrageSurfaceGif"
+                             class="viz-image"
+                             src="/assets/arbitrage_surface.gif"
+                             alt="3D arbitrage surface showing where edges live across Kalshi and Polymarket YES prices">
+                        <div class="viz-legend">
+                            <span class="viz-legend-item"><span class="viz-swatch viz-swatch-loss"></span>loss zone</span>
+                            <span class="viz-legend-item"><span class="viz-swatch viz-swatch-edge"></span>thin edge</span>
+                            <span class="viz-legend-item"><span class="viz-swatch viz-swatch-profit"></span>profit zone</span>
+                            <span class="viz-legend-item"><span class="viz-dot viz-dot-live"></span>live opp.</span>
+                        </div>
+                        <p class="viz-caption">
+                            X = Kalshi YES &middot; Y = Polymarket YES &middot; Z = net edge (cents) after fees &amp; slippage.
+                            The diagonal valley is where prices align (no arbitrage); the corners are the largest dislocations.
+                        </p>
+                    </div>
+                </div>
             </section>
 
             <!-- Right Panel - Terminal & Stats -->

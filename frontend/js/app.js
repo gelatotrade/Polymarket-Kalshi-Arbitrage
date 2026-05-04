@@ -119,6 +119,32 @@ function initializeSocket() {
     state.socket.on('wallet_connected', (data) => {
         log(`Wallet connected: ${data.address.slice(0, 8)}...${data.address.slice(-6)} (${data.platform})`, 'success');
     });
+
+    // Visualization updates (e.g. fresh 3D arbitrage surface GIF)
+    state.socket.on('visualization_updated', (data) => {
+        if (data && data.kind === 'arbitrage_surface') {
+            reloadArbitrageSurface(data.url || '/assets/arbitrage_surface.gif');
+            log('3D arbitrage surface refreshed', 'system');
+        }
+    });
+}
+
+// ============================================
+// 3D Arbitrage Surface Visualization
+// ============================================
+
+function reloadArbitrageSurface(baseUrl) {
+    const img = document.getElementById('arbitrageSurfaceGif');
+    if (!img) return;
+    const url = baseUrl || '/assets/arbitrage_surface.gif';
+    // Cache-bust so the browser fetches the freshly rendered GIF.
+    img.src = `${url}?t=${Date.now()}`;
+}
+
+function refreshArbitrageSurface() {
+    log('Re-rendering 3D arbitrage surface...', 'system');
+    fetch('/api/visualizations/arbitrage_surface/regenerate', { method: 'POST' })
+        .catch((err) => log(`Surface regenerate failed: ${err.message}`, 'error'));
 }
 
 // ============================================
@@ -699,5 +725,6 @@ window.arbitrage = {
     state,
     log,
     startScan,
-    refreshData
+    refreshData,
+    refreshArbitrageSurface
 };
