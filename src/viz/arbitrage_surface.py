@@ -4,10 +4,12 @@
 Builds an animated GIF that visualises the cross-platform arbitrage
 profit landscape between Kalshi and Polymarket. The X axis is the
 Kalshi YES price, the Y axis is the Polymarket YES price and the Z
-axis is the net profit percentage after fees and slippage. Detected
-opportunities are projected onto the surface as glowing markers so
-that the operator can immediately see where the live edges sit on
-the theoretical landscape.
+axis is the net edge (cents per dollar of notional) after fees and
+slippage. The camera is fixed; instead the surface itself deforms
+elastically frame-by-frame to reflect live market activity. Each
+opportunity contributes a localised, pulsing bump on the surface
+and travels along a small orbit so the operator can see how the
+edge landscape "breathes" as prices move.
 """
 
 from __future__ import annotations
@@ -17,14 +19,13 @@ import logging
 import math
 import os
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import imageio.v2 as imageio
 import matplotlib
 matplotlib.use("Agg")  # headless rendering
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib import cm
 from matplotlib.colors import LinearSegmentedColormap, Normalize
 
 logger = logging.getLogger(__name__)
@@ -59,113 +60,207 @@ class ArbPoint:
     label: str = ""
 
 
-def _profit_grid(
+def _base_surface(
     kalshi_axis: np.ndarray,
     poly_axis: np.ndarray,
     fee_pct: float,
     slippage_pct: float,
-) -> np.ndarray:
-    """Compute the net edge surface on a grid of YES prices.
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute the static base surface (mesh + Z) on a grid of YES prices.
 
-    For each (k, p) in the grid we model the optimal cross-platform
-    YES trade: buy on the cheaper platform, sell on the richer one.
-    The metric is the absolute spread expressed in cents per dollar
-    of notional, minus fees and slippage. This produces a clean
-    V-valley along the diagonal (no arbitrage when prices match)
-    that rises smoothly toward the corners (largest dislocations).
+    The base metric is the absolute spread expressed in cents per
+    dollar of notional, minus fees and slippage. This produces a
+    clean V-valley along the diagonal (no arbitrage when prices
+    match) that rises smoothly toward the corners.
     """
-    k, p = np.meshgrid(kalshi_axis, poly_axis, indexing="xy")
-    spread_cents = np.abs(p - k) * 100.0
-    return spread_cents - (fee_pct + slippage_pct)
+    K, P = np.meshgrid(kalshi_axis, poly_axis, indexing="xy")
+    spread_cents = np.abs(P - K) * 100.0
+    Z = spread_cents - (fee_pct + slippage_pct)
+    return K, P, Z
 
 
 class ArbitrageSurfaceRenderer:
-    """Render the arbitrage profit surface as a rotating GIF."""
+    """Render the arbitrage profit surface as an elastic, breathing GIF.
+
+    The camera is fixed; the surface itself deforms over time. Three
+    deformation components are summed onto the static base:
+
+    * a diagonal traveling wave that ripples along the no-arbitrage
+      valley, simulating shared market sentiment moving both venues
+      in tandem;
+    * localised Gaussian "activity bumps" centred on each live
+      opportunity, with pulsing amplitude;
+    * a slow global heave so the whole surface feels alive even when
+      no opportunities are present.
+    """
 
     def __init__(
         self,
         grid_size: int = 70,
         fee_pct: float = 3.0,
         slippage_pct: float = 1.0,
-        frames: int = 30,
-        elev: float = 32.0,
+        frames: int = 36,
+        elev: float = 30.0,
+        azim: float = -62.0,
         figsize: tuple = (7.0, 5.2),
         dpi: int = 100,
         price_floor: float = 0.05,
-        z_clip: float = 30.0,
+        wave_amplitude: float = 4.5,
+        cross_wave_amplitude: float = 2.5,
+        bump_amplitude: float = 9.0,
+        bump_sigma: float = 0.075,
+        orbit_radius: float = 0.075,
+        heave_amplitude: float = 1.6,
     ):
         self.grid_size = grid_size
         self.fee_pct = fee_pct
         self.slippage_pct = slippage_pct
         self.frames = frames
         self.elev = elev
+        self.azim = azim
         self.figsize = figsize
         self.dpi = dpi
         self.price_floor = price_floor
-        self.z_clip = z_clip
+        self.wave_amplitude = wave_amplitude
+        self.cross_wave_amplitude = cross_wave_amplitude
+        self.bump_amplitude = bump_amplitude
+        self.bump_sigma = bump_sigma
+        self.orbit_radius = orbit_radius
+        self.heave_amplitude = heave_amplitude
 
-        # Real prediction markets rarely trade below a few cents; clipping the
+        # Real prediction markets rarely trade at the extremes; clipping the
         # axis to [price_floor, 1 - price_floor] keeps the corner singularities
-        # (where dividing by ~0 explodes) out of the visible surface.
+        # out of the visible surface.
         self._kalshi_axis = np.linspace(price_floor, 1.0 - price_floor, grid_size)
         self._poly_axis = np.linspace(price_floor, 1.0 - price_floor, grid_size)
-        self._z = _profit_grid(
+        self._K, self._P, self._Z_base = _base_surface(
             self._kalshi_axis, self._poly_axis, fee_pct, slippage_pct
         )
 
-    @property
-    def z_min(self) -> float:
-        return float(np.min(self._z))
+        # Pre-compute the rotated diagonal coordinates used by the wave term.
+        # diag goes along the k=p axis, cross is perpendicular to it.
+        self._diag = (self._K + self._P) / math.sqrt(2.0)
+        self._cross = (self._P - self._K) / math.sqrt(2.0)
 
-    @property
-    def z_max(self) -> float:
-        return float(np.max(self._z))
+    # --- animation primitives -------------------------------------------------
 
-    def _draw_frame(self, azim: float, points: Sequence[ArbPoint]) -> np.ndarray:
+    def _orbit_params(self, index: int) -> Tuple[float, float, float, float]:
+        """Deterministic orbit (radius, freq_x, freq_y, phase) per point."""
+        radius = self.orbit_radius * (0.7 + 0.5 * ((index * 13) % 7) / 7.0)
+        freq_x = 1.0 + 0.25 * ((index * 5) % 4)
+        freq_y = 1.0 + 0.25 * ((index * 7) % 4) + 0.1
+        phase = (index * 1.7) % (2.0 * math.pi)
+        return radius, freq_x, freq_y, phase
+
+    def _animate_points(self, base: Sequence[ArbPoint], t: float) -> List[ArbPoint]:
+        """Return new opportunity positions at time ``t`` (radians)."""
+        out: List[ArbPoint] = []
+        floor = self.price_floor
+        for i, pt in enumerate(base):
+            radius, fx, fy, phase = self._orbit_params(i)
+            dx = radius * math.cos(t * fx + phase)
+            dy = radius * math.sin(t * fy + phase * 1.3)
+            k = float(np.clip(pt.kalshi_yes + dx, floor, 1.0 - floor))
+            p = float(np.clip(pt.poly_yes + dy, floor, 1.0 - floor))
+            net = abs(p - k) * 100.0 - (self.fee_pct + self.slippage_pct)
+            out.append(
+                ArbPoint(
+                    kalshi_yes=k,
+                    poly_yes=p,
+                    net_profit_pct=net,
+                    label=pt.label,
+                )
+            )
+        return out
+
+    def _deformed_surface(self, animated: Sequence[ArbPoint], t: float) -> np.ndarray:
+        """Return the deformed Z grid at time ``t``.
+
+        Combines the static base with two traveling wave families,
+        a slow global heave, and Gaussian bumps centred on each
+        animated opportunity. All time terms use sin/cos of ``t``
+        so the GIF loops cleanly when ``t`` sweeps a full 2π
+        interval.
+        """
+        Z = self._Z_base.copy()
+
+        # 1. Diagonal traveling wave (concentrated near the no-arb valley).
+        wave = (
+            self.wave_amplitude
+            * np.sin(7.0 * self._diag - 2.0 * t)
+            * np.exp(-(self._cross ** 2) / 0.06)
+        )
+        Z = Z + wave
+
+        # 2. Cross-diagonal wave so deformation isn't a single 1D ripple.
+        cross_wave = (
+            self.cross_wave_amplitude
+            * np.cos(5.0 * self._cross + 1.7 * t)
+            * np.exp(-((self._diag - math.sqrt(2.0) / 2.0) ** 2) / 0.18)
+        )
+        Z = Z + cross_wave
+
+        # 3. Slow global heave so the whole sheet breathes.
+        heave = self.heave_amplitude * math.sin(t)
+        Z = Z + heave
+
+        # 4. Pulsing Gaussian bumps at each live opportunity. Each bump
+        #    breathes harder than before so individual opportunities
+        #    visibly throb on the surface.
+        sigma2 = 2.0 * self.bump_sigma ** 2
+        for i, pt in enumerate(animated):
+            _, _, _, phase = self._orbit_params(i)
+            pulse = self.bump_amplitude * (0.55 + 0.75 * math.sin(1.5 * t + phase))
+            Z = Z + pulse * np.exp(
+                -((self._K - pt.kalshi_yes) ** 2 + (self._P - pt.poly_yes) ** 2) / sigma2
+            )
+
+        return Z
+
+    # --- rendering ------------------------------------------------------------
+
+    def _draw_frame(
+        self,
+        t: float,
+        base_points: Sequence[ArbPoint],
+        z_norm: Normalize,
+        z_floor: float,
+        z_ceil: float,
+        n_points: int,
+    ) -> np.ndarray:
+        animated = self._animate_points(base_points, t)
+        Z = self._deformed_surface(animated, t)
+
         fig = plt.figure(figsize=self.figsize, dpi=self.dpi, facecolor=_TERMINAL_BG)
         ax = fig.add_subplot(111, projection="3d", facecolor=_PANEL_BG)
 
-        x, y = np.meshgrid(self._kalshi_axis, self._poly_axis, indexing="xy")
-        norm = Normalize(vmin=self.z_min, vmax=max(self.z_max, 0.5))
-
         ax.plot_surface(
-            x,
-            y,
-            self._z,
+            self._K,
+            self._P,
+            Z,
             cmap=_ARB_CMAP,
-            norm=norm,
+            norm=z_norm,
             linewidth=0.0,
             antialiased=True,
-            alpha=0.92,
+            alpha=0.93,
             rstride=2,
             cstride=2,
             edgecolor="none",
             shade=True,
         )
 
-        # Break-even contour at z = 0 to highlight the edge of profit.
-        try:
-            ax.contour(
-                x,
-                y,
-                self._z,
-                levels=[0.0],
-                colors=["#e6edf3"],
-                linewidths=1.0,
-                linestyles="dashed",
-                offset=0.0,
-            )
-        except Exception:
-            # contour at offset can fail on degenerate surfaces; skip silently
-            pass
-
-        # Project live opportunities onto the surface, slightly above so the
-        # markers do not get hidden inside the mesh.
-        if points:
-            xs = [pt.kalshi_yes for pt in points]
-            ys = [pt.poly_yes for pt in points]
-            zs = [pt.net_profit_pct + 1.5 for pt in points]
-            colors = ["#3fb950" if pt.net_profit_pct >= 0 else "#f85149" for pt in points]
+        # Project the animated opportunities onto the deformed surface.
+        if animated:
+            xs = [pt.kalshi_yes for pt in animated]
+            ys = [pt.poly_yes for pt in animated]
+            # Sample the deformed Z field at each marker so the glyph rides on
+            # top of the breathing surface, slightly lifted to stay readable.
+            zs: List[float] = []
+            for k, p in zip(xs, ys):
+                ix = int(np.clip(round((k - self.price_floor) / (1.0 - 2 * self.price_floor) * (self.grid_size - 1)), 0, self.grid_size - 1))
+                iy = int(np.clip(round((p - self.price_floor) / (1.0 - 2 * self.price_floor) * (self.grid_size - 1)), 0, self.grid_size - 1))
+                zs.append(float(Z[iy, ix]) + 1.5)
+            colors = ["#3fb950" if pt.net_profit_pct >= 0 else "#f85149" for pt in animated]
             ax.scatter(
                 xs,
                 ys,
@@ -177,16 +272,14 @@ class ArbitrageSurfaceRenderer:
                 depthshade=False,
                 zorder=10,
             )
-            # Drop a vertical drop-line so the marker reads against the surface
-            base_z = min(self.z_min, -self.fee_pct - self.slippage_pct - 2.0)
             for xi, yi, zi in zip(xs, ys, zs):
                 ax.plot(
                     [xi, xi],
                     [yi, yi],
-                    [base_z, zi],
+                    [z_floor, zi],
                     color="#58a6ff",
                     linewidth=0.8,
-                    alpha=0.65,
+                    alpha=0.6,
                 )
 
         ax.set_xlabel("Kalshi YES price", color=_TEXT_SECONDARY, fontsize=9, labelpad=8)
@@ -202,8 +295,9 @@ class ArbitrageSurfaceRenderer:
 
         ax.set_xlim(0.0, 1.0)
         ax.set_ylim(0.0, 1.0)
-        ax.set_zlim(min(self.z_min, -self.fee_pct - self.slippage_pct - 2.0), max(self.z_max, 5.0))
-        ax.view_init(elev=self.elev, azim=azim)
+        ax.set_zlim(z_floor, z_ceil)
+        # Fixed camera: no rotation across frames.
+        ax.view_init(elev=self.elev, azim=self.azim)
 
         for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
             axis.set_pane_color((0.04, 0.05, 0.07, 1.0))
@@ -223,7 +317,7 @@ class ArbitrageSurfaceRenderer:
         fig.text(
             0.98,
             0.04,
-            f"opportunities: {len(points)}",
+            f"live opportunities: {n_points}",
             color=_TEXT_SECONDARY,
             fontsize=8,
             ha="right",
@@ -248,7 +342,7 @@ class ArbitrageSurfaceRenderer:
         points: Optional[Sequence[ArbPoint]] = None,
         fps: int = 18,
     ) -> str:
-        """Render the rotating surface GIF to ``output_path``.
+        """Render the elastic surface GIF to ``output_path``.
 
         Args:
             output_path: Destination path for the GIF.
@@ -261,13 +355,28 @@ class ArbitrageSurfaceRenderer:
         points = list(points or [])
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-        azimuths = np.linspace(-60, 300, self.frames, endpoint=False)
-        frames = [self._draw_frame(float(az), points) for az in azimuths]
+        # Pre-compute global Z range so the colormap and Z-axis stay stable
+        # across frames (otherwise the colours and tick marks would jitter
+        # as the surface deforms).
+        wave_headroom = self.wave_amplitude + self.cross_wave_amplitude + self.heave_amplitude
+        z_min = float(np.min(self._Z_base)) - wave_headroom
+        z_max = float(np.max(self._Z_base)) + wave_headroom + (
+            self.bump_amplitude * 1.4 if points else 0.0
+        )
+        z_floor = min(z_min, -self.fee_pct - self.slippage_pct - 2.0)
+        z_ceil = max(z_max, 5.0)
+        z_norm = Normalize(vmin=z_min, vmax=max(z_max, 0.5))
 
-        # Loop forever (loop=0). Use a moderate quantizer for compact size.
+        # Sweep t over a full period so the loop is seamless.
+        ts = np.linspace(0.0, 2.0 * math.pi, self.frames, endpoint=False)
+        frames = [
+            self._draw_frame(float(t), points, z_norm, z_floor, z_ceil, len(points))
+            for t in ts
+        ]
+
         imageio.mimsave(output_path, frames, format="GIF", fps=fps, loop=0)
         logger.info(
-            "Rendered arbitrage surface GIF: %s (%d frames, %d points)",
+            "Rendered elastic arbitrage surface GIF: %s (%d frames, %d points)",
             output_path,
             len(frames),
             len(points),
@@ -306,7 +415,7 @@ def render_arbitrage_gif(
     slippage_pct: float = 1.0,
     frames: int = 36,
     fps: int = 18,
-    grid_size: int = 60,
+    grid_size: int = 70,
 ) -> str:
     """Convenience wrapper used by the server and CLI.
 
