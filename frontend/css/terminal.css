@@ -929,7 +929,17 @@ body {
 
 .viz-swatch-kalshi { background: #39c5cf; }
 .viz-swatch-poly   { background: #d29922; }
-.viz-swatch-arb    { background: #3fb950; }
+.viz-swatch-profit { background: #3fb950; }
+.viz-swatch-edge   { background: #d29922; }
+.viz-swatch-loss   { background: #f85149; }
+
+.viz-star {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    background: #ffffff;
+    clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);
+}
 
 .viz-dot {
     display: inline-block;

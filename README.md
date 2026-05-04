@@ -9,9 +9,16 @@ A sophisticated arbitrage trading bot that identifies and exploits price discrep
 
 ## 3D Arbitrage Surface
 
-Two live YES‑price surfaces in the same 3D plot — **cyan = Kalshi**, **amber = Polymarket** — plotted across matched markets (X) and a sliding time window (Y → now). The vertical gap between the two ribbons at any (market, time) is the cross‑platform arbitrage edge; the green bars on the "now" edge highlight markets whose Kalshi vs Polymarket spread currently exceeds the actionable threshold.
+Two live YES‑price surfaces in the same 3D plot — **cyan = Kalshi**, **amber = Polymarket** — plotted across matched markets (X) and a sliding time window (Y → now). The vertical gap between the two ribbons at any (market, time) is the cross‑platform arbitrage edge.
 
-The camera is fixed; the surfaces themselves scroll forward in time so each frame represents the latest tape from both venues. Where the ribbons hug each other there is no arbitrage; where they pull apart, there is an opportunity.
+Every actionable arbitrage on the "now" edge is marked with:
+
+- a **colour‑coded glowing bar** between the two prices (🟢 green ≥ 5 ¢ net after fees, 🟡 amber 1–5 ¢, 🔴 red < 1 ¢),
+- **star markers** in venue colour at the exact Kalshi and Polymarket prices,
+- a **floor spotlight diamond** directly under the column to anchor it on the (market, time) plane,
+- a **cent label** showing the live spread (e.g. `+12.9¢`).
+
+The camera is fixed; the surfaces themselves scroll forward in time so each frame represents the latest tape from both venues. Where the ribbons hug each other there is no arbitrage; where they pull apart, the markers light up.
 
 <p align="center">
   <img src="frontend/assets/arbitrage_surface.gif" alt="Live Kalshi vs Polymarket YES price surfaces" width="640">

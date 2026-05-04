@@ -27,6 +27,7 @@ import matplotlib
 matplotlib.use("Agg")  # headless rendering
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
 logger = logging.getLogger(__name__)
@@ -44,8 +45,11 @@ _KALSHI_COLOR = "#39c5cf"      # cyan
 _KALSHI_EDGE = "#1f6feb"
 _POLY_COLOR = "#d29922"        # amber
 _POLY_EDGE = "#db6d28"
-_ARB_BAR_PROFIT = "#3fb950"
-_ARB_BAR_THIN = "#a371f7"
+
+# Arbitrage bar tiers (net edge in cents after fees + slippage)
+_ARB_PROFIT_HIGH = "#3fb950"   # net >= 5  c (bright green)
+_ARB_PROFIT_LOW = "#d29922"    # 1 <= net < 5 (amber, thin edge)
+_ARB_MARGINAL = "#f85149"      # net <  1 (red, barely covers fees)
 
 
 @dataclass
@@ -221,7 +225,10 @@ class ArbitrageSurfaceRenderer:
             zorder=4,
         )
 
-        # Vertical arbitrage bars at "now": one per market with a visible gap
+        # Vertical arbitrage bars at "now": one per market with a visible gap.
+        # Each bar is rendered as a layered glow + star endpoints + floor
+        # spotlight + cent label so the operator can immediately see the
+        # actionable spread, its size and its profitability after fees.
         n_arbs = 0
         for m in range(N):
             k_now = float(K[m, -1])
@@ -232,27 +239,98 @@ class ArbitrageSurfaceRenderer:
             n_arbs += 1
             z_lo = min(k_now, p_now)
             z_hi = max(k_now, p_now)
-            net_edge_cents = gap * 100.0 - (self.fee_pct + self.slippage_pct)
-            color = _ARB_BAR_PROFIT if net_edge_cents > 0 else _ARB_BAR_THIN
+            gap_cents = gap * 100.0
+            net_cents = gap_cents - (self.fee_pct + self.slippage_pct)
+
+            # Colour band by net profitability after fees and slippage.
+            if net_cents >= 5.0:
+                bar_color = _ARB_PROFIT_HIGH   # bright green: clear profit
+            elif net_cents >= 1.0:
+                bar_color = _ARB_PROFIT_LOW    # amber: thin edge
+            else:
+                bar_color = _ARB_MARGINAL      # red: barely covers fees
+
+            # Floor projection (vertical guide from the ground up) to anchor
+            # the bar in the (market, time) plane and make the column easy
+            # to track even when the bar is short.
             ax.plot(
                 [m, m],
                 [now_y, now_y],
-                [z_lo, z_hi],
-                color=color,
-                linewidth=2.6,
-                solid_capstyle="round",
-                zorder=5,
+                [0.0, z_lo],
+                color=bar_color,
+                linewidth=0.9,
+                alpha=0.45,
+                linestyle=(0, (3, 2)),
+                zorder=4,
+            )
+
+            # Layered glow bar (outer halo + mid + crisp inner line).
+            for lw, alpha in ((9.0, 0.18), (5.5, 0.40), (2.8, 1.0)):
+                ax.plot(
+                    [m, m],
+                    [now_y, now_y],
+                    [z_lo, z_hi],
+                    color=bar_color,
+                    linewidth=lw,
+                    alpha=alpha,
+                    solid_capstyle="round",
+                    zorder=5,
+                )
+
+            # Star markers at each endpoint with white outline so they read
+            # cleanly against either surface. Colour the marker by venue so
+            # it is obvious which side is the buy and which is the sell.
+            ax.scatter(
+                [m],
+                [now_y],
+                [k_now],
+                c=[_KALSHI_COLOR],
+                s=170,
+                marker="*",
+                edgecolors="#ffffff",
+                linewidths=1.3,
+                depthshade=False,
+                zorder=8,
             )
             ax.scatter(
-                [m, m],
-                [now_y, now_y],
-                [z_lo, z_hi],
-                c=[_KALSHI_COLOR, _POLY_COLOR] if k_now < p_now else [_POLY_COLOR, _KALSHI_COLOR],
-                s=42,
+                [m],
+                [now_y],
+                [p_now],
+                c=[_POLY_COLOR],
+                s=170,
+                marker="*",
                 edgecolors="#ffffff",
-                linewidths=0.7,
+                linewidths=1.3,
                 depthshade=False,
-                zorder=6,
+                zorder=8,
+            )
+
+            # Floor spotlight diamond directly under the arb column.
+            ax.scatter(
+                [m],
+                [now_y],
+                [0.005],
+                c=[bar_color],
+                s=90,
+                marker="D",
+                edgecolors="#ffffff",
+                linewidths=1.0,
+                depthshade=False,
+                zorder=7,
+            )
+
+            # Cent label floating next to the bar, in the bar colour so the
+            # profitability tier is encoded redundantly.
+            mid_z = 0.5 * (k_now + p_now)
+            ax.text(
+                m + 0.35,
+                now_y + 0.2,
+                mid_z,
+                f"+{gap_cents:.1f}¢",
+                color=bar_color,
+                fontsize=8,
+                fontweight="bold",
+                zorder=10,
             )
 
         # Optional overlay of explicit ArbPoint instances. Distribute
@@ -262,7 +340,12 @@ class ArbitrageSurfaceRenderer:
             slots = np.linspace(0, N - 1, num=min(len(overlay), N))
             for slot, pt in zip(slots, overlay):
                 m = float(slot)
-                color = _ARB_BAR_PROFIT if pt.net_profit_pct > 0 else _ARB_BAR_THIN
+                if pt.net_profit_pct >= 5.0:
+                    color = _ARB_PROFIT_HIGH
+                elif pt.net_profit_pct >= 1.0:
+                    color = _ARB_PROFIT_LOW
+                else:
+                    color = _ARB_MARGINAL
                 ax.plot(
                     [m, m],
                     [now_y + 0.4, now_y + 0.4],
@@ -298,17 +381,36 @@ class ArbitrageSurfaceRenderer:
                 tick.set_color(_TEXT_SECONDARY)
                 tick.set_fontsize(8)
 
-        # Legend (proxy artists since plot_surface doesn't auto-legend)
+        # Legend (proxy artists since plot_surface doesn't auto-legend).
+        # We show the two venue ribbons and the three arbitrage tiers so
+        # the operator can read the colour code on the bars at a glance.
+        legend_handles = [
+            Patch(facecolor=_KALSHI_COLOR, edgecolor=_KALSHI_EDGE, alpha=0.7, label="Kalshi YES"),
+            Patch(facecolor=_POLY_COLOR, edgecolor=_POLY_EDGE, alpha=0.7, label="Polymarket YES"),
+            Line2D([0], [0], color=_ARB_PROFIT_HIGH, linewidth=4, label="arb ≥ 5¢ net"),
+            Line2D([0], [0], color=_ARB_PROFIT_LOW, linewidth=4, label="arb 1–5¢ net"),
+            Line2D([0], [0], color=_ARB_MARGINAL, linewidth=4, label="arb < 1¢ (fees)"),
+            Line2D(
+                [0], [0], marker="*", color="none",
+                markerfacecolor=_KALSHI_COLOR, markeredgecolor="#ffffff",
+                markersize=10, linestyle="none", label="Kalshi price",
+            ),
+            Line2D(
+                [0], [0], marker="*", color="none",
+                markerfacecolor=_POLY_COLOR, markeredgecolor="#ffffff",
+                markersize=10, linestyle="none", label="Poly price",
+            ),
+        ]
         legend = ax.legend(
-            handles=[
-                Patch(facecolor=_KALSHI_COLOR, edgecolor=_KALSHI_EDGE, alpha=0.7, label="Kalshi YES"),
-                Patch(facecolor=_POLY_COLOR, edgecolor=_POLY_EDGE, alpha=0.7, label="Polymarket YES"),
-                Patch(facecolor=_ARB_BAR_PROFIT, edgecolor="#ffffff", alpha=0.9, label="Live arb bar"),
-            ],
+            handles=legend_handles,
             loc="upper left",
             frameon=False,
-            fontsize=8,
+            fontsize=7.5,
             labelcolor=_TEXT_SECONDARY,
+            ncol=1,
+            handlelength=1.6,
+            handletextpad=0.6,
+            borderaxespad=0.2,
         )
 
         fig.text(
@@ -318,10 +420,17 @@ class ArbitrageSurfaceRenderer:
             color=_TEXT_SECONDARY,
             fontsize=8,
         )
+        # Total tradable cents across all live arbs gives a quick read of
+        # how much edge the market is offering right now.
+        total_gap_cents = 0.0
+        for m in range(N):
+            g = abs(float(K[m, -1]) - float(P[m, -1]))
+            if g >= self.arb_threshold:
+                total_gap_cents += g * 100.0
         fig.text(
             0.98,
             0.04,
-            f"live arb gaps: {n_arbs}",
+            f"live arbs: {n_arbs}   total spread: {total_gap_cents:.1f}¢",
             color=_TEXT_SECONDARY,
             fontsize=8,
             ha="right",

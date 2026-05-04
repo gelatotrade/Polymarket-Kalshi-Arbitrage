@@ -155,14 +155,19 @@
                         <div class="viz-legend">
                             <span class="viz-legend-item"><span class="viz-swatch viz-swatch-kalshi"></span>Kalshi YES</span>
                             <span class="viz-legend-item"><span class="viz-swatch viz-swatch-poly"></span>Polymarket YES</span>
-                            <span class="viz-legend-item"><span class="viz-swatch viz-swatch-arb"></span>live arb gap</span>
-                            <span class="viz-legend-item"><span class="viz-dot viz-dot-live"></span>now edge</span>
+                            <span class="viz-legend-item"><span class="viz-swatch viz-swatch-profit"></span>arb &ge; 5&cent; net</span>
+                            <span class="viz-legend-item"><span class="viz-swatch viz-swatch-edge"></span>arb 1&ndash;5&cent;</span>
+                            <span class="viz-legend-item"><span class="viz-swatch viz-swatch-loss"></span>arb &lt; 1&cent;</span>
+                            <span class="viz-legend-item"><span class="viz-star"></span>price marker</span>
                         </div>
                         <p class="viz-caption">
                             X = matched market &middot; Y = time &rarr; now &middot; Z = YES price.
                             Two ribbons in one plot: cyan = Kalshi, amber = Polymarket. The vertical gap between them is
                             the cross-platform arbitrage edge. Surfaces scroll forward in time as live data arrives;
-                            green bars on the now edge mark markets whose spread currently exceeds the actionable threshold.
+                            on the now edge, every actionable arbitrage is marked with a colour-coded glowing bar
+                            (green = profitable after fees, amber = thin edge, red = below fee threshold), star markers at the
+                            exact Kalshi and Polymarket prices, a floor spotlight diamond underneath, and a cent label
+                            showing the live spread.
                         </p>
                     </div>
                 </div>
