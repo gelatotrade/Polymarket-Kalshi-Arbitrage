@@ -7,8 +7,23 @@ A sophisticated arbitrage trading bot that identifies and exploits price discrep
 ![Web3](https://img.shields.io/badge/Web3-Enabled-purple?style=for-the-badge&logo=ethereum)
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 
+## 3D Arbitrage Surface
+
+A rotating 3D surface of the cross-platform edge landscape: **X** = Kalshi YES price, **Y** = Polymarket YES price, **Z** = net edge in cents after fees and slippage. The diagonal valley is where prices align (no arbitrage); the corners are the largest dislocations. Live opportunities are projected onto the surface as glowing markers with drop-lines.
+
+<p align="center">
+  <img src="frontend/assets/arbitrage_surface.gif" alt="3D arbitrage surface visualization" width="640">
+</p>
+
+The animation is regenerated automatically after every market scan and served from `/assets/arbitrage_surface.gif`. To re-render manually:
+
+```bash
+python -m src.viz.arbitrage_surface
+```
+
 ## Table of Contents
 
+- [3D Arbitrage Surface](#3d-arbitrage-surface)
 - [Features](#features)
 - [How It Works](#how-it-works)
 - [Architecture](#architecture)
