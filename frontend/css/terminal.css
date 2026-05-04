@@ -927,9 +927,19 @@ body {
     border: 1px solid rgba(255, 255, 255, 0.15);
 }
 
-.viz-swatch-loss { background: linear-gradient(90deg, #1f6feb, #39c5cf); }
-.viz-swatch-edge { background: linear-gradient(90deg, #39c5cf, #d29922); }
-.viz-swatch-profit { background: linear-gradient(90deg, #3fb950, #a371f7); }
+.viz-swatch-kalshi { background: #39c5cf; }
+.viz-swatch-poly   { background: #d29922; }
+.viz-swatch-profit { background: #3fb950; }
+.viz-swatch-edge   { background: #d29922; }
+.viz-swatch-loss   { background: #f85149; }
+
+.viz-star {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    background: #ffffff;
+    clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);
+}
 
 .viz-dot {
     display: inline-block;
