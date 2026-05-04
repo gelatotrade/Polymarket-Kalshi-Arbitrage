@@ -40,6 +40,7 @@ A sophisticated arbitrage trading bot that identifies and exploits price discrep
 - **Live Market Data**: WebSocket-powered streaming of market prices and opportunities
 - **Trade History**: Complete log of executed trades with P&L tracking
 - **Interactive Filters**: Filter opportunities by minimum profit and maximum risk
+- **3D Arbitrage Surface**: Animated GIF visualisation of the cross-platform edge landscape with live opportunities projected onto it (`/assets/arbitrage_surface.gif`)
 - **Keyboard Shortcuts**: `Ctrl+S` to scan, `Esc` to close modals
 
 ### Technical Features

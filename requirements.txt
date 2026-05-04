@@ -20,6 +20,11 @@ py-clob-client>=0.0.7
 pandas>=2.1.0
 numpy>=1.26.0
 
+# Visualization (3D arbitrage surface GIF generation)
+matplotlib>=3.8.0
+imageio>=2.31.0
+Pillow>=10.0.0
+
 # Utilities
 python-dotenv>=1.0.0
 pydantic>=2.5.0

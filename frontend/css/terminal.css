@@ -878,6 +878,79 @@ body {
     background: var(--text-muted);
 }
 
+/* 3D Arbitrage Surface Visualization */
+.viz-section {
+    flex-shrink: 0;
+    border-top: 1px solid var(--border-primary);
+    margin-top: var(--spacing-sm);
+}
+
+.viz-container {
+    padding: var(--spacing-md);
+    display: flex;
+    flex-direction: column;
+    gap: var(--spacing-sm);
+}
+
+.viz-image {
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius-md);
+    box-shadow: var(--glow-blue);
+    display: block;
+}
+
+.viz-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--spacing-md);
+    font-size: 10px;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.viz-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--spacing-xs);
+}
+
+.viz-swatch {
+    display: inline-block;
+    width: 14px;
+    height: 8px;
+    border-radius: 2px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.viz-swatch-loss { background: linear-gradient(90deg, #1f6feb, #39c5cf); }
+.viz-swatch-edge { background: linear-gradient(90deg, #39c5cf, #d29922); }
+.viz-swatch-profit { background: linear-gradient(90deg, #3fb950, #a371f7); }
+
+.viz-dot {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    border: 1px solid #ffffff;
+}
+
+.viz-dot-live {
+    background: var(--accent-green);
+    box-shadow: 0 0 6px rgba(63, 185, 80, 0.6);
+}
+
+.viz-caption {
+    font-size: 10px;
+    color: var(--text-muted);
+    line-height: 1.5;
+    margin: 0;
+}
+
 /* Responsive */
 @media (max-width: 1400px) {
     .terminal-main {
