@@ -1,21 +1,46 @@
 """
-Polymarket API Client
+Polymarket API Client.
 
-Based on Polymarket CLOB API and Gamma Markets API
-Documentation: https://docs.polymarket.com/
+Read-only market data is fetched through the public Gamma API
+directly (async via httpx). Trading goes through the official
+``py-clob-client`` Python SDK, which handles the EIP-712 typed
+data order signing, L1/L2 auth derivation and tick-size lookups
+that real Polymarket CLOB orders require. The synchronous SDK
+calls are wrapped with ``asyncio.to_thread`` so they do not block
+the event loop.
 """
 
-import time
+import asyncio
 import json
 import logging
-from typing import Optional, Dict, List, Any, Tuple
+import time
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
 import httpx
-import asyncio
 from eth_account import Account
 from eth_account.messages import encode_defunct
 from web3 import Web3
+
+try:  # The SDK is required for trading; reading still works without it.
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import (
+        ApiCreds,
+        BalanceAllowanceParams,
+        OrderArgs,
+        OrderType,
+    )
+    from py_clob_client.constants import POLYGON
+    _CLOB_SDK_AVAILABLE = True
+except Exception as _exc:  # pragma: no cover - SDK missing in some envs
+    ClobClient = None  # type: ignore[assignment]
+    ApiCreds = None  # type: ignore[assignment]
+    BalanceAllowanceParams = None  # type: ignore[assignment]
+    OrderArgs = None  # type: ignore[assignment]
+    OrderType = None  # type: ignore[assignment]
+    POLYGON = 137
+    _CLOB_SDK_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -77,25 +102,36 @@ class PolymarketClient:
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
         api_passphrase: Optional[str] = None,
-        web3_provider: Optional[str] = None
+        web3_provider: Optional[str] = None,
+        clob_url: Optional[str] = None,
+        gamma_url: Optional[str] = None,
+        chain_id: int = POLYGON_CHAIN_ID,
     ):
-        """
-        Initialize Polymarket client
+        """Initialize Polymarket client.
 
         Args:
-            private_key: Ethereum wallet private key for signing
-            api_key: CLOB API key (optional, for authenticated endpoints)
-            api_secret: CLOB API secret
-            api_passphrase: CLOB API passphrase
-            web3_provider: Web3 RPC provider URL
+            private_key: Ethereum wallet private key (hex). Required
+                for trading; optional for read-only usage.
+            api_key, api_secret, api_passphrase: Pre-derived CLOB
+                L2 credentials. If omitted but ``private_key`` is
+                supplied, the SDK will derive them on first connect.
+            web3_provider: Polygon RPC URL (e.g. Alchemy / Infura).
+            clob_url, gamma_url: API base overrides (handy for tests).
+            chain_id: EVM chain id (defaults to Polygon mainnet).
         """
         self.private_key = private_key
         self.api_key = api_key
         self.api_secret = api_secret
         self.api_passphrase = api_passphrase
+        self.clob_url = clob_url or self.CLOB_URL
+        self.gamma_url = gamma_url or self.GAMMA_URL
+        self.chain_id = chain_id
 
         self._client: Optional[httpx.AsyncClient] = None
         self._address: Optional[str] = None
+
+        # CLOB SDK (sync) — instantiated lazily on first auth use.
+        self._clob: Optional[ClobClient] = None
 
         # Initialize Web3
         if web3_provider:
@@ -116,9 +152,10 @@ class PolymarketClient:
         await self.disconnect()
 
     async def connect(self):
-        """Initialize HTTP client"""
+        """Initialize HTTP client (and the CLOB SDK if we have a key)."""
         self._client = httpx.AsyncClient(timeout=30.0)
-        logger.info("Polymarket client connected")
+        signing = "wallet" if self.private_key else "anonymous"
+        logger.info("Polymarket client connected (auth=%s)", signing)
 
     async def disconnect(self):
         """Close HTTP client"""
@@ -126,6 +163,73 @@ class PolymarketClient:
             await self._client.aclose()
             self._client = None
         logger.info("Polymarket client disconnected")
+
+    # ------------------------------------------------------------------ CLOB SDK
+
+    @property
+    def has_signing_key(self) -> bool:
+        return bool(self.private_key)
+
+    def _ensure_clob(self) -> ClobClient:
+        """Lazily initialise the synchronous CLOB SDK and ensure it
+        has L2 API credentials so it can place signed orders.
+
+        Raises ``RuntimeError`` if either the SDK isn't installed or
+        the operator did not provide a private key.
+        """
+        if not _CLOB_SDK_AVAILABLE:
+            raise RuntimeError(
+                "py-clob-client is not installed; trading is disabled. "
+                "Add `py-clob-client>=0.0.7` to your environment."
+            )
+        if not self.private_key:
+            raise RuntimeError(
+                "POLYMARKET_PRIVATE_KEY is required to place CLOB orders."
+            )
+
+        if self._clob is not None:
+            return self._clob
+
+        if self.api_key and self.api_secret and self.api_passphrase:
+            creds = ApiCreds(
+                api_key=self.api_key,
+                api_secret=self.api_secret,
+                api_passphrase=self.api_passphrase,
+            )
+            client = ClobClient(
+                host=self.clob_url,
+                key=self.private_key,
+                chain_id=self.chain_id,
+                creds=creds,
+            )
+        else:
+            # Derive L2 creds from the wallet on first use. This calls
+            # the CLOB ``/auth/derive-api-key`` endpoint under the hood.
+            client = ClobClient(
+                host=self.clob_url,
+                key=self.private_key,
+                chain_id=self.chain_id,
+            )
+            try:
+                creds = client.create_or_derive_api_creds()
+                client.set_api_creds(creds)
+                self.api_key = creds.api_key
+                self.api_secret = creds.api_secret
+                self.api_passphrase = creds.api_passphrase
+                logger.info(
+                    "Derived Polymarket CLOB API credentials for %s",
+                    self._address,
+                )
+            except Exception as exc:
+                logger.error("Failed to derive Polymarket CLOB credentials: %s", exc)
+                raise
+
+        self._clob = client
+        return client
+
+    async def _run_clob(self, fn, *args, **kwargs):
+        """Run a synchronous CLOB SDK call without blocking the loop."""
+        return await asyncio.to_thread(fn, *args, **kwargs)
 
     @property
     def address(self) -> Optional[str]:
@@ -399,7 +503,7 @@ class PolymarketClient:
             params={"token_id": token_id}
         )
 
-    # ==================== Trading ====================
+    # ==================== Trading (via py-clob-client SDK) ====================
 
     async def create_order(
         self,
@@ -407,61 +511,71 @@ class PolymarketClient:
         side: str,
         price: float,
         size: float,
-        order_type: str = "GTC"
+        order_type: str = "GTC",
+        fee_rate_bps: int = 0,
     ) -> Dict[str, Any]:
-        """
-        Create a new order on CLOB
+        """Sign and submit a CLOB limit order.
+
+        The SDK handles EIP-712 typed data signing, salt/nonce
+        generation, tick-size lookup and L2 auth headers.
 
         Args:
-            token_id: CLOB token ID
-            side: "BUY" or "SELL"
-            price: Limit price (0-1)
-            size: Order size in USDC
-            order_type: Order type (GTC, GTD, FOK)
-
-        Returns:
-            Order response
+            token_id: CLOB ERC-1155 token id (numeric string).
+            side: "BUY" or "SELL".
+            price: Limit price in [0, 1].
+            size: Number of contracts (not USDC notional).
+            order_type: "GTC", "GTD" or "FOK".
+            fee_rate_bps: Maker fee in basis points; usually 0.
         """
-        if not self.private_key:
-            raise ValueError("Private key required for trading")
+        clob = self._ensure_clob()
 
-        # Build order data
-        order_data = {
-            "tokenId": token_id,
-            "side": side.upper(),
-            "price": str(price),
-            "size": str(size),
-            "type": order_type,
-            "feeRateBps": "0"
-        }
+        # Map our string order types to the SDK enum.
+        order_type_map = {"GTC": OrderType.GTC, "GTD": OrderType.GTD, "FOK": OrderType.FOK}
+        ot = order_type_map.get(order_type.upper(), OrderType.GTC)
 
-        return await self._request(
-            "POST",
-            f"{self.CLOB_URL}/order",
-            data=order_data,
-            signed=True
+        order_args = OrderArgs(
+            token_id=str(token_id),
+            price=float(price),
+            size=float(size),
+            side=side.upper(),
+            fee_rate_bps=int(fee_rate_bps),
         )
+
+        signed_order = await self._run_clob(clob.create_order, order_args)
+        return await self._run_clob(clob.post_order, signed_order, ot)
 
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
-        """Cancel an existing order"""
-        return await self._request(
-            "DELETE",
-            f"{self.CLOB_URL}/order/{order_id}",
-            signed=True
-        )
+        """Cancel an existing order via the SDK."""
+        clob = self._ensure_clob()
+        return await self._run_clob(clob.cancel, order_id)
+
+    async def cancel_all(self) -> Dict[str, Any]:
+        """Cancel every resting order for the wallet."""
+        clob = self._ensure_clob()
+        return await self._run_clob(clob.cancel_all)
 
     async def get_orders(self, market: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get open orders"""
-        params = {}
+        """Get open orders for the wallet."""
+        clob = self._ensure_clob()
         if market:
-            params["market"] = market
+            return await self._run_clob(clob.get_orders, market=market)
+        return await self._run_clob(clob.get_orders)
 
-        return await self._request(
-            "GET",
-            f"{self.CLOB_URL}/orders",
-            params=params,
-            signed=True
-        )
+    async def get_order(self, order_id: str) -> Dict[str, Any]:
+        """Get a single order by id (used to poll for fills)."""
+        clob = self._ensure_clob()
+        return await self._run_clob(clob.get_order, order_id)
+
+    async def get_balance_allowance(self, asset_type: str = "COLLATERAL") -> Dict[str, Any]:
+        """Read on-chain USDC balance + approval for the proxy wallet.
+
+        ``asset_type`` is "COLLATERAL" for USDC or "CONDITIONAL" for
+        outcome tokens. Used by the trade executor to skip arbs the
+        wallet cannot actually fund.
+        """
+        clob = self._ensure_clob()
+        params = BalanceAllowanceParams(asset_type=asset_type)
+        return await self._run_clob(clob.get_balance_allowance, params)
 
     async def get_trades(
         self,

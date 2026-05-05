@@ -199,9 +199,22 @@ cp .env.example .env
 # Edit configuration
 nano .env  # or use your preferred editor
 
+# (Optional) run the test suite to confirm the install
+pytest
+
 # Start the server
 python main.py server
 ```
+
+### Producing the credentials
+
+| Field | Where to get it |
+|---|---|
+| `KALSHI_API_KEY` + `KALSHI_PRIVATE_KEY_PATH` | Sign in at https://kalshi.com → Profile → Account → API Keys → "Create API key". Save the displayed key id (`KALSHI_API_KEY`) and download the RSA private key (.pem) Kalshi gives you once — point `KALSHI_PRIVATE_KEY_PATH` at it. Kalshi signs every request with RSA-PSS-SHA256, so the .pem is mandatory. |
+| `POLYMARKET_PRIVATE_KEY` | The private key of a Polygon wallet that holds USDC (the "funder" wallet). The first time the bot trades it derives L2 API credentials from this wallet automatically. |
+| `WEB3_PROVIDER_URL` | An Alchemy / Infura / QuickNode Polygon mainnet RPC URL. The free tiers are enough for the read traffic this bot generates. |
+
+Leave `DRY_RUN=true` while you verify that scans return the markets you expect — orders will be logged but not sent. Flip to `false` only after you've watched a full scan/match/detect cycle and confirmed the opportunities make sense.
 
 ### Docker Installation (Optional)
 
@@ -524,6 +537,25 @@ src/
 2. **New Detection Strategy**: Extend `ArbitrageDetector`
 3. **New UI Component**: Update `frontend/`
 
+## Production readiness
+
+What works out of the box after `pip install -r requirements.txt`:
+
+- ✅ **Cold start**: `python main.py server` boots without `.env`, serves the dashboard and the demo 3D surface immediately.
+- ✅ **Kalshi auth**: RSA-PSS-SHA256 signing per the current Kalshi spec (HMAC was retired in 2024). Verified by `tests/test_kalshi_signing.py` against the standard `cryptography` verifier.
+- ✅ **Polymarket trading**: orders go through the official `py-clob-client` SDK, which handles EIP-712 typed data signing, L1/L2 auth derivation and tick-size lookup.
+- ✅ **Token-id resolution**: Polymarket leg uses the correct CLOB ERC-1155 outcome token (the YES/NO `clobTokenId` from the matched market) instead of the Kalshi ticker.
+- ✅ **Pre-trade balance gate**: every Polymarket buy queries `get_balance_allowance` and aborts if the funder wallet is underfunded.
+- ✅ **Leg reconciliation**: if the buy succeeds and the sell fails, the executor attempts to cancel the resting buy on its venue and logs a clear warning if it can't.
+- ✅ **Tests**: `pytest` runs 24 unit tests covering signing, profit math, fuzzy matching, the rolling price tape and the executor identifier resolution.
+
+What still requires operator attention:
+
+- ⚠️ **Kalshi key issuance**: the API key + RSA `.pem` have to be created manually in the Kalshi UI and pointed at via `KALSHI_API_KEY` + `KALSHI_PRIVATE_KEY_PATH`.
+- ⚠️ **Polymarket wallet setup**: the funder wallet has to hold USDC on Polygon and have approved the Polymarket exchange contracts. The `py-clob-client` README walks through this once.
+- ⚠️ **Live trading**: `DRY_RUN=false` is opt-in. Always run a few scans in dry mode first and verify the matched markets and profit numbers look right before flipping the switch.
+- ⚠️ **Monitoring**: there is no Prometheus / Grafana wiring; logs go to stdout and `LOG_FILE` only.
+
 ## Troubleshooting
 
 ### Common Issues
@@ -543,6 +575,17 @@ lsof -i :8080
 - Verify API credentials in `.env`
 - Check network connectivity
 - Kalshi may be rate limiting - wait and retry
+
+#### Kalshi `403 Forbidden` / `signature invalid`
+
+- Confirm `KALSHI_API_KEY` matches the key id displayed in the Kalshi UI.
+- Confirm `KALSHI_PRIVATE_KEY_PATH` (or `KALSHI_PRIVATE_KEY_PEM`) points at the `.pem` Kalshi gave you when the key was created.
+- Run `pytest tests/test_kalshi_signing.py -v` to verify the signing pipeline locally.
+
+#### Polymarket order rejected with `not enough balance`
+
+- Check the on-chain USDC balance of the funder wallet on Polygon.
+- Make sure that wallet has approved the Polymarket exchange contracts (`py-clob-client` exposes `update_balance_allowance` for first-time setup).
 
 #### "MetaMask not detected"
 

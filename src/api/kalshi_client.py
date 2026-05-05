@@ -1,23 +1,75 @@
 """
 Kalshi API Client
 
-Based on Kalshi Trading API v2
-Documentation: https://docs.kalshi.com/welcome
+Based on Kalshi Trading API v2.
+
+Authenticates requests using **RSA-PSS-SHA256**, which is what
+Kalshi's current API spec requires (the legacy HMAC scheme was
+retired in 2024). Each request signs the string
+
+    f"{timestamp_ms}{METHOD}{path}"
+
+with the operator's private RSA key (loaded once from a PEM file
+configured via ``KALSHI_PRIVATE_KEY_PATH``) and sends the
+base64-encoded signature in the ``KALSHI-ACCESS-SIGNATURE`` header
+along with ``KALSHI-ACCESS-KEY`` (the API key id) and
+``KALSHI-ACCESS-TIMESTAMP``.
+
+Documentation: https://trading-api.readme.io/reference/getting-started
 """
 
-import time
-import hmac
-import hashlib
 import base64
 import json
 import logging
-from typing import Optional, Dict, List, Any
-from datetime import datetime, timezone
+import os
+import time
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
+
 import httpx
-import asyncio
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 logger = logging.getLogger(__name__)
+
+
+def _load_rsa_private_key(
+    key_pem: Optional[str] = None,
+    key_path: Optional[str] = None,
+    password: Optional[str] = None,
+) -> Optional[rsa.RSAPrivateKey]:
+    """Load an RSA private key from inline PEM text or a file path.
+
+    Returns ``None`` if no key material is available — callers should
+    treat that as "read-only mode" and skip signing.
+    """
+    pem_bytes: Optional[bytes] = None
+    if key_pem and "BEGIN" in key_pem:
+        pem_bytes = key_pem.encode()
+    elif key_path:
+        try:
+            with open(os.path.expanduser(key_path), "rb") as f:
+                pem_bytes = f.read()
+        except OSError as exc:
+            logger.error("Failed to read Kalshi RSA key from %s: %s", key_path, exc)
+            return None
+
+    if not pem_bytes:
+        return None
+
+    pwd = password.encode() if password else None
+    try:
+        key = serialization.load_pem_private_key(pem_bytes, password=pwd)
+    except Exception as exc:  # invalid PEM, wrong password, etc.
+        logger.error("Failed to parse Kalshi RSA key: %s", exc)
+        return None
+
+    if not isinstance(key, rsa.RSAPrivateKey):
+        logger.error("Kalshi private key must be RSA (got %s)", type(key).__name__)
+        return None
+    return key
 
 
 @dataclass
@@ -54,35 +106,56 @@ class KalshiMarket:
 
 class KalshiClient:
     """
-    Async client for Kalshi Trading API v2
+    Async client for Kalshi Trading API v2.
 
-    Handles authentication, market data fetching, and order execution.
+    Handles RSA-PSS-SHA256 authentication, market data fetching, and
+    order execution. Read-only methods work without credentials but
+    will be subject to Kalshi's stricter rate limits / 403s for
+    unauthenticated traffic; trading methods raise unless an API key
+    + RSA private key are configured.
     """
 
-    BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
+    BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
     DEMO_URL = "https://demo-api.kalshi.co/trade-api/v2"
 
     def __init__(
         self,
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
-        demo_mode: bool = False
+        demo_mode: bool = False,
+        private_key_pem: Optional[str] = None,
+        private_key_path: Optional[str] = None,
+        private_key_password: Optional[str] = None,
+        base_url: Optional[str] = None,
     ):
-        """
-        Initialize Kalshi client
+        """Initialize Kalshi client.
 
         Args:
-            api_key: Kalshi API key
-            api_secret: Kalshi API secret (private key)
-            demo_mode: Use demo API endpoint
+            api_key: Kalshi API key id (sent in ``KALSHI-ACCESS-KEY``).
+            api_secret: Legacy HMAC secret. Kept for backwards
+                compatibility but ignored when an RSA key is supplied
+                (which the current Kalshi API requires).
+            demo_mode: If true, use the demo API endpoint.
+            private_key_pem: Optional inline PEM-encoded RSA key.
+            private_key_path: Optional path to a PEM file holding the
+                RSA private key.
+            private_key_password: Password for an encrypted PEM, if any.
+            base_url: Override the API base URL (useful for tests).
         """
         self.api_key = api_key
         self.api_secret = api_secret
-        self.base_url = self.DEMO_URL if demo_mode else self.BASE_URL
         self.demo_mode = demo_mode
+        self.base_url = base_url or (self.DEMO_URL if demo_mode else self.BASE_URL)
+        self._private_key = _load_rsa_private_key(
+            key_pem=private_key_pem,
+            key_path=private_key_path,
+            password=private_key_password,
+        )
         self._client: Optional[httpx.AsyncClient] = None
         self._token: Optional[str] = None
         self._token_expiry: Optional[datetime] = None
+
+    # ------------------------------------------------------------------ context
 
     async def __aenter__(self):
         await self.connect()
@@ -94,7 +167,12 @@ class KalshiClient:
     async def connect(self):
         """Initialize HTTP client"""
         self._client = httpx.AsyncClient(timeout=30.0)
-        logger.info(f"Kalshi client connected (demo={self.demo_mode})")
+        signing = "rsa" if self._private_key else "anonymous"
+        logger.info(
+            "Kalshi client connected (demo=%s, auth=%s)",
+            self.demo_mode,
+            signing,
+        )
 
     async def disconnect(self):
         """Close HTTP client"""
@@ -103,47 +181,60 @@ class KalshiClient:
             self._client = None
         logger.info("Kalshi client disconnected")
 
-    def _generate_signature(self, timestamp: str, method: str, path: str, body: str = "") -> str:
+    # ------------------------------------------------------------------ signing
+
+    @property
+    def has_signing_key(self) -> bool:
+        return self._private_key is not None
+
+    def _generate_signature(self, timestamp_ms: str, method: str, path: str) -> str:
+        """Generate an RSA-PSS-SHA256 signature for the request.
+
+        The signed string follows Kalshi's spec exactly:
+        ``"{timestamp_ms}{METHOD}{path}"`` — note that ``path`` must
+        be the full path **including** the API prefix
+        (``/trade-api/v2/...``) but **without** the query string.
         """
-        Generate RSA-SHA256 signature for API authentication
+        if not self._private_key:
+            return ""
+        message = f"{timestamp_ms}{method.upper()}{path}".encode()
+        signature = self._private_key.sign(
+            message,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        return base64.b64encode(signature).decode()
 
-        Args:
-            timestamp: Unix timestamp in milliseconds
-            method: HTTP method (GET, POST, etc.)
-            path: API endpoint path
-            body: Request body (empty string for GET)
+    def _path_for_signature(self, endpoint: str) -> str:
+        """Return the path portion that should be signed for ``endpoint``.
 
-        Returns:
-            Base64 encoded signature
+        ``endpoint`` is the path relative to ``base_url`` (e.g.
+        ``/markets``). Kalshi signs the full path, so we re-join it
+        with the base URL's path component.
         """
-        message = f"{timestamp}{method}{path}{body}"
+        base_path = urlsplit(self.base_url).path.rstrip("/")
+        return f"{base_path}{endpoint}"
 
-        # For API key auth, use HMAC-SHA256
-        if self.api_secret:
-            signature = hmac.new(
-                self.api_secret.encode(),
-                message.encode(),
-                hashlib.sha256
-            ).digest()
-            return base64.b64encode(signature).decode()
-        return ""
-
-    def _get_headers(self, method: str, path: str, body: str = "") -> Dict[str, str]:
+    def _get_headers(self, method: str, endpoint: str) -> Dict[str, str]:
         """Generate authenticated headers"""
-        timestamp = str(int(time.time() * 1000))
-
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
 
-        if self.api_key:
-            headers["KALSHI-ACCESS-KEY"] = self.api_key
-            headers["KALSHI-ACCESS-TIMESTAMP"] = timestamp
-            headers["KALSHI-ACCESS-SIGNATURE"] = self._generate_signature(
-                timestamp, method, path, body
+        if self.api_key and self._private_key:
+            timestamp_ms = str(int(time.time() * 1000))
+            signature = self._generate_signature(
+                timestamp_ms,
+                method,
+                self._path_for_signature(endpoint),
             )
-
+            headers["KALSHI-ACCESS-KEY"] = self.api_key
+            headers["KALSHI-ACCESS-TIMESTAMP"] = timestamp_ms
+            headers["KALSHI-ACCESS-SIGNATURE"] = signature
         return headers
 
     async def _request(
@@ -170,7 +261,7 @@ class KalshiClient:
 
         url = f"{self.base_url}{endpoint}"
         body = json.dumps(data) if data else ""
-        headers = self._get_headers(method, endpoint, body)
+        headers = self._get_headers(method, endpoint)
 
         try:
             response = await self._client.request(

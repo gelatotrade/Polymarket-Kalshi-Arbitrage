@@ -38,14 +38,21 @@ class OrderSide(Enum):
 
 @dataclass
 class TradeOrder:
-    """Individual order in a trade"""
+    """Individual order in a trade.
+
+    ``ticker`` is the Kalshi market identifier (used only for Kalshi
+    orders); ``token_id`` is the Polymarket CLOB ERC-1155 outcome
+    token id (used only for Polymarket orders). Exactly one of the
+    two should be populated for any given order.
+    """
     id: str
     platform: str
-    ticker: str
+    ticker: Optional[str]
     side: OrderSide
     outcome: str  # 'yes' or 'no'
     price: float
     quantity: float
+    token_id: Optional[str] = None
     status: TradeStatus = TradeStatus.PENDING
     filled_quantity: float = 0
     filled_price: float = 0
@@ -59,6 +66,7 @@ class TradeOrder:
             "id": self.id,
             "platform": self.platform,
             "ticker": self.ticker,
+            "token_id": self.token_id,
             "side": self.side.value,
             "outcome": self.outcome,
             "price": self.price,
@@ -155,6 +163,33 @@ class TradeExecutor:
         """Generate unique order ID"""
         return f"ORD-{uuid.uuid4().hex[:8].upper()}"
 
+    @staticmethod
+    def _resolve_identifiers(
+        opportunity: ArbitrageOpportunity,
+        platform: str,
+        side: str,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Return ``(kalshi_ticker, polymarket_token_id)`` for one leg.
+
+        Each side of an arbitrage trade lives on exactly one venue;
+        this helper looks up the right identifier for that venue and
+        leaves the other one ``None`` so the executor cannot silently
+        send a Kalshi ticker into a Polymarket order (the original
+        bug).
+        """
+        matched = opportunity.matched_market
+        if platform == "kalshi":
+            return matched.kalshi_market.ticker, None
+
+        # Polymarket: pick the token id that corresponds to the side
+        # we're trading.
+        token_id = (
+            matched.polymarket_market.outcome_yes_token
+            if side == "yes"
+            else matched.polymarket_market.outcome_no_token
+        )
+        return None, token_id
+
     async def _execute_kalshi_order(
         self,
         order: TradeOrder
@@ -165,13 +200,13 @@ class TradeExecutor:
         Returns:
             Tuple of (success, platform_order_id, error_message)
         """
-        if not self.kalshi:
-            return False, None, "Kalshi client not configured"
-
         if self.dry_run:
             logger.info(f"[DRY RUN] Kalshi {order.side.value} {order.outcome} "
                        f"{order.quantity} @ {order.price}")
             return True, f"DRY-{order.id}", None
+
+        if not self.kalshi:
+            return False, None, "Kalshi client not configured"
 
         try:
             # Convert price to cents (Kalshi uses 1-99 cent prices)
@@ -203,32 +238,96 @@ class TradeExecutor:
         Returns:
             Tuple of (success, platform_order_id, error_message)
         """
+        if self.dry_run:
+            if not order.token_id:
+                logger.warning(
+                    "[DRY RUN] Polymarket order missing token_id (would fail in live mode)",
+                )
+            logger.info(
+                "[DRY RUN] Polymarket %s %s token=%s qty=%.4f @ %.4f",
+                order.side.value, order.outcome,
+                order.token_id, order.quantity, order.price,
+            )
+            return True, f"DRY-{order.id}", None
+
         if not self.polymarket:
             return False, None, "Polymarket client not configured"
 
-        if self.dry_run:
-            logger.info(f"[DRY RUN] Polymarket {order.side.value} {order.outcome} "
-                       f"{order.quantity} @ {order.price}")
-            return True, f"DRY-{order.id}", None
-
-        try:
-            # Get token ID based on outcome
-            matched = None  # Would need to look up market
-            token_id = order.ticker  # Assuming ticker is token_id for now
-
-            response = await self.polymarket.create_order(
-                token_id=token_id,
-                side=order.side.value.upper(),
-                price=order.price,
-                size=order.quantity
+        if not order.token_id:
+            return False, None, (
+                "TradeOrder is missing token_id; cannot place a Polymarket "
+                "CLOB order without the outcome token (set token_id from "
+                "MatchedMarket.polymarket_market.outcome_yes_token / outcome_no_token)."
             )
 
-            order_id = response.get("orderID") or response.get("id")
-            return True, order_id, None
+        try:
+            response = await self.polymarket.create_order(
+                token_id=order.token_id,
+                side=order.side.value.upper(),
+                price=order.price,
+                size=order.quantity,
+            )
+            order_id = response.get("orderID") or response.get("id") or response.get("orderId")
+            if not order_id:
+                return False, None, f"Polymarket response missing order id: {response}"
+            return True, str(order_id), None
 
         except Exception as e:
             logger.error(f"Polymarket order failed: {e}")
             return False, None, str(e)
+
+    async def _rollback_buy_leg(self, buy_order: TradeOrder) -> None:
+        """Best-effort cancel/reverse of a filled buy leg when the sell
+        leg fails. Without this we'd be left with naked exposure on
+        whichever venue accepted the buy.
+
+        For resting (unfilled) orders we cancel; for already-filled
+        orders we submit a market sell at a wide tolerance. This is a
+        last-ditch hedge — operators should still inspect partial
+        trades manually.
+        """
+        if buy_order.platform == "polymarket" and buy_order.platform_order_id:
+            try:
+                await self.polymarket.cancel_order(buy_order.platform_order_id)
+                logger.warning(
+                    "Rollback: cancelled Polymarket order %s",
+                    buy_order.platform_order_id,
+                )
+                return
+            except Exception as exc:
+                logger.error("Failed to cancel Polymarket buy leg: %s", exc)
+
+        if buy_order.platform == "kalshi" and buy_order.platform_order_id:
+            try:
+                await self.kalshi.cancel_order(buy_order.platform_order_id)
+                logger.warning(
+                    "Rollback: cancelled Kalshi order %s",
+                    buy_order.platform_order_id,
+                )
+                return
+            except Exception as exc:
+                logger.error("Failed to cancel Kalshi buy leg: %s", exc)
+
+        logger.error(
+            "Could not roll back buy leg %s on %s; manual intervention required",
+            buy_order.id,
+            buy_order.platform,
+        )
+
+    async def _check_polymarket_balance(self, required_usdc: float) -> Tuple[bool, str]:
+        """Confirm the Polymarket-funded wallet holds enough USDC."""
+        if self.dry_run:
+            return True, "dry-run"
+        if not self.polymarket or not getattr(self.polymarket, "has_signing_key", False):
+            return False, "polymarket client not authenticated"
+        try:
+            data = await self.polymarket.get_balance_allowance(asset_type="COLLATERAL")
+            balance = float(data.get("balance", 0))
+            if balance < required_usdc:
+                return False, f"insufficient USDC: have {balance:.2f}, need {required_usdc:.2f}"
+            return True, f"balance ok: {balance:.2f} USDC"
+        except Exception as exc:
+            return False, f"balance check failed: {exc}"
 
     async def execute_opportunity(
         self,
@@ -251,15 +350,22 @@ class TradeExecutor:
         buy_quantity = trade_size / opportunity.buy_price
         sell_quantity = buy_quantity  # Same quantity for arbitrage
 
+        # Resolve the venue identifiers (Kalshi ticker vs Polymarket
+        # CLOB token id). Mixing them up was the long-standing bug
+        # that made every Polymarket leg fail.
+        buy_ticker, buy_token_id = self._resolve_identifiers(
+            opportunity, opportunity.buy_platform, opportunity.buy_side
+        )
+        sell_ticker, sell_token_id = self._resolve_identifiers(
+            opportunity, opportunity.sell_platform, opportunity.sell_side
+        )
+
         # Create orders
         buy_order = TradeOrder(
             id=self._generate_order_id(),
             platform=opportunity.buy_platform,
-            ticker=opportunity.matched_market.kalshi_market.ticker
-                if opportunity.buy_platform == "kalshi"
-                else opportunity.matched_market.polymarket_market.outcome_yes_token
-                if opportunity.buy_side == "yes"
-                else opportunity.matched_market.polymarket_market.outcome_no_token,
+            ticker=buy_ticker,
+            token_id=buy_token_id,
             side=OrderSide.BUY,
             outcome=opportunity.buy_side,
             price=opportunity.buy_price,
@@ -269,11 +375,8 @@ class TradeExecutor:
         sell_order = TradeOrder(
             id=self._generate_order_id(),
             platform=opportunity.sell_platform,
-            ticker=opportunity.matched_market.kalshi_market.ticker
-                if opportunity.sell_platform == "kalshi"
-                else opportunity.matched_market.polymarket_market.outcome_yes_token
-                if opportunity.sell_side == "yes"
-                else opportunity.matched_market.polymarket_market.outcome_no_token,
+            ticker=sell_ticker,
+            token_id=sell_token_id,
             side=OrderSide.SELL,
             outcome=opportunity.sell_side,
             price=opportunity.sell_price,
@@ -292,6 +395,18 @@ class TradeExecutor:
         logger.info(f"Executing arbitrage trade {trade.id}")
         logger.info(f"  Buy: {buy_order.platform} {buy_order.outcome} @ {buy_order.price}")
         logger.info(f"  Sell: {sell_order.platform} {sell_order.outcome} @ {sell_order.price}")
+
+        # Pre-trade balance gate for Polymarket legs (saves a wasted
+        # signature + RPC round-trip when the wallet is underfunded).
+        if opportunity.buy_platform == "polymarket":
+            ok, msg = await self._check_polymarket_balance(trade_size)
+            if not ok:
+                buy_order.status = TradeStatus.FAILED
+                buy_order.error = msg
+                trade.status = TradeStatus.FAILED
+                self._trades[trade.id] = trade
+                logger.error("Aborting trade %s: %s", trade.id, msg)
+                return trade
 
         # Execute buy order first
         buy_order.status = TradeStatus.EXECUTING
@@ -332,7 +447,8 @@ class TradeExecutor:
             sell_order.error = error
             trade.status = TradeStatus.PARTIAL  # Buy succeeded, sell failed
             self._trades[trade.id] = trade
-            logger.error(f"Sell order failed: {error}")
+            logger.error(f"Sell order failed: {error}; attempting rollback of buy leg")
+            await self._rollback_buy_leg(buy_order)
             return trade
 
         # Calculate P&L

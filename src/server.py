@@ -425,14 +425,21 @@ class ArbitrageServer:
             self.kalshi_client = KalshiClient(
                 api_key=self.config.kalshi.api_key,
                 api_secret=self.config.kalshi.api_secret,
-                demo_mode=self.config.kalshi.demo_mode
+                demo_mode=self.config.kalshi.demo_mode,
+                private_key_path=self.config.kalshi.private_key_path,
+                private_key_pem=self.config.kalshi.private_key_pem,
+                private_key_password=self.config.kalshi.private_key_password,
+                base_url=self.config.kalshi.api_url,
             )
             await self.kalshi_client.connect()
 
         if not self.polymarket_client:
             self.polymarket_client = PolymarketClient(
                 private_key=self.config.polymarket.private_key,
-                web3_provider=self.config.web3.provider_url
+                web3_provider=self.config.web3.provider_url,
+                clob_url=self.config.polymarket.api_url,
+                gamma_url=self.config.polymarket.gamma_url,
+                chain_id=self.config.web3.chain_id,
             )
             await self.polymarket_client.connect()
 
