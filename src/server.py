@@ -22,9 +22,16 @@ from .api.polymarket_client import PolymarketClient
 from .core.market_matcher import MarketMatcher, MatchedMarket
 from .core.arbitrage_detector import ArbitrageDetector, ArbitrageOpportunity
 from .core.trade_executor import TradeExecutor, ArbitrageTrade
+from .core.price_tape import PriceTapeBuffer
 from .utils.config import Config
 from .utils.logger import setup_logging
 from .viz import render_arbitrage_gif
+
+# Tape geometry must match the renderer defaults below.
+_VIZ_FRAMES = 30
+_VIZ_WINDOW = 18
+_VIZ_N_MARKETS = 14
+_VIZ_TAPE_LENGTH = _VIZ_FRAMES + _VIZ_WINDOW
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +82,15 @@ class ArbitrageServer:
         self.executor = TradeExecutor(
             max_trade_size=self.config.trading.max_trade_size,
             dry_run=self.config.trading.dry_run
+        )
+
+        # Live YES‑price history per matched market, fed by every scan.
+        # Once the buffer holds at least one snapshot the 3D viz renders
+        # from real Kalshi / Polymarket data instead of the synthetic
+        # demo tape.
+        self.price_tape = PriceTapeBuffer(
+            max_markets=_VIZ_N_MARKETS,
+            max_length=_VIZ_TAPE_LENGTH,
         )
 
         # State
@@ -458,6 +474,16 @@ class ArbitrageServer:
             )
             logger.info(f"Found {len(self.matched_markets)} matched markets")
 
+            # Record latest YES prices into the rolling tape buffer so
+            # the 3D visualisation reflects real Kalshi / Polymarket
+            # price evolution across successive scans.
+            recorded = self.price_tape.record(self.matched_markets)
+            logger.info(
+                "Price tape: recorded %d markets (tracking %d total)",
+                recorded,
+                self.price_tape.tracked_markets,
+            )
+
             # Detect arbitrage
             self.socketio.emit('scan_progress', {
                 'stage': 'detecting',
@@ -505,19 +531,55 @@ class ArbitrageServer:
             raise
 
     def _render_surface_gif(self):
-        """Background task that renders the 3D arbitrage surface GIF."""
+        """Background task that renders the 3D arbitrage surface GIF.
+
+        Uses live YES‑price history from ``self.price_tape`` once any
+        scan has populated it; otherwise falls back to the synthetic
+        demo so the asset is still useful before the first scan.
+        """
         try:
             assets_dir = os.path.join(self.app.static_folder, 'assets')
             os.makedirs(assets_dir, exist_ok=True)
             output_path = os.path.join(assets_dir, 'arbitrage_surface.gif')
-            render_arbitrage_gif(
-                output_path,
-                opportunities=self.detector.get_opportunities(),
+
+            tapes = self.price_tape.get_tapes(
+                n_markets=_VIZ_N_MARKETS,
+                length=_VIZ_TAPE_LENGTH,
             )
+            if tapes is not None:
+                kalshi_tape, poly_tape, market_labels = tapes
+                render_arbitrage_gif(
+                    output_path,
+                    opportunities=self.detector.get_opportunities(),
+                    kalshi_tape=kalshi_tape,
+                    poly_tape=poly_tape,
+                    market_labels=market_labels,
+                    frames=_VIZ_FRAMES,
+                    window=_VIZ_WINDOW,
+                    n_markets=_VIZ_N_MARKETS,
+                    data_source="live",
+                )
+                logger.info(
+                    "Rendered live arbitrage surface GIF (markets=%d)",
+                    kalshi_tape.shape[0],
+                )
+            else:
+                render_arbitrage_gif(
+                    output_path,
+                    opportunities=self.detector.get_opportunities(),
+                    frames=_VIZ_FRAMES,
+                    window=_VIZ_WINDOW,
+                    n_markets=_VIZ_N_MARKETS,
+                    data_source="synthetic",
+                )
+                logger.info("Rendered synthetic demo arbitrage surface GIF")
+
             self.socketio.emit('visualization_updated', {
                 'kind': 'arbitrage_surface',
                 'url': '/assets/arbitrage_surface.gif',
                 'rendered_at': datetime.utcnow().isoformat(),
+                'data_source': 'live' if tapes is not None else 'synthetic',
+                'markets_in_tape': self.price_tape.tracked_markets,
             })
         except Exception as exc:
             logger.warning("Failed to render arbitrage surface GIF: %s", exc)

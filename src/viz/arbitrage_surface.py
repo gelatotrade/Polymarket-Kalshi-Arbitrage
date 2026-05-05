@@ -65,11 +65,12 @@ class ArbPoint:
 class ArbitrageSurfaceRenderer:
     """Render two scrolling YES-price surfaces (Kalshi vs Polymarket).
 
-    The price tapes are synthetic but periodic with period
-    ``frames``, so the resulting GIF loops seamlessly. Each market
-    has its own slow trend plus a divergence component that pulls
-    Kalshi and Polymarket apart at different times — exactly the
-    pattern a real cross-venue arbitrage tape exhibits.
+    The price tapes can be supplied directly (real Kalshi /
+    Polymarket history collected over multiple scans) or generated
+    synthetically as a placeholder for the very first render. When
+    real tapes are provided the surfaces show actual cross-venue
+    price evolution; when synthetic, they use periodic sin/cos
+    components so the loop is seamless.
     """
 
     def __init__(
@@ -85,6 +86,10 @@ class ArbitrageSurfaceRenderer:
         fee_pct: float = 3.0,
         slippage_pct: float = 1.0,
         arb_threshold: float = 0.045,
+        kalshi_tape: Optional[np.ndarray] = None,
+        poly_tape: Optional[np.ndarray] = None,
+        market_labels: Optional[Sequence[str]] = None,
+        data_source: str = "synthetic",
     ):
         self.n_markets = n_markets
         self.window = window
@@ -97,8 +102,59 @@ class ArbitrageSurfaceRenderer:
         self.fee_pct = fee_pct
         self.slippage_pct = slippage_pct
         self.arb_threshold = arb_threshold
+        self.data_source = data_source
 
-        self._kalshi_tape, self._poly_tape = self._generate_tapes()
+        if kalshi_tape is not None and poly_tape is not None:
+            self._kalshi_tape, self._poly_tape = self._adapt_tapes(
+                np.asarray(kalshi_tape, dtype=float),
+                np.asarray(poly_tape, dtype=float),
+            )
+        else:
+            self._kalshi_tape, self._poly_tape = self._generate_tapes()
+
+        # Override the market count to match whatever the tapes
+        # actually contain (real-data tapes may have fewer rows).
+        self.n_markets = self._kalshi_tape.shape[0]
+        self.market_labels: Optional[List[str]] = (
+            list(market_labels) if market_labels else None
+        )
+
+    # --- tape adaptation (real data) -----------------------------------------
+
+    def _adapt_tapes(
+        self,
+        kalshi: np.ndarray,
+        poly: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Coerce supplied tapes to shape ``(N, frames + window)``.
+
+        Real tapes might be slightly shorter than ``F + W`` if not
+        enough scans have run yet. We left-pad with the first
+        observed value so the surface is always renderable.
+        """
+        if kalshi.shape != poly.shape:
+            raise ValueError(
+                f"kalshi_tape ({kalshi.shape}) and poly_tape ({poly.shape}) must match"
+            )
+        if kalshi.ndim != 2:
+            raise ValueError("price tapes must be 2D arrays of shape (N, T)")
+
+        target_T = self.frames + self.window
+        N, T = kalshi.shape
+        if T == target_T:
+            return kalshi, poly
+        if T > target_T:
+            return kalshi[:, -target_T:], poly[:, -target_T:]
+
+        # Left-pad with the first observed sample per market.
+        pad = target_T - T
+        kalshi_padded = np.concatenate(
+            [np.repeat(kalshi[:, :1], pad, axis=1), kalshi], axis=1
+        )
+        poly_padded = np.concatenate(
+            [np.repeat(poly[:, :1], pad, axis=1), poly], axis=1
+        )
+        return kalshi_padded, poly_padded
 
     # --- price tape generation -----------------------------------------------
 
@@ -416,7 +472,8 @@ class ArbitrageSurfaceRenderer:
         fig.text(
             0.02,
             0.04,
-            f"fees+slippage modeled: {self.fee_pct + self.slippage_pct:.1f}%",
+            f"fees+slippage modeled: {self.fee_pct + self.slippage_pct:.1f}%   "
+            f"data: {self.data_source}",
             color=_TEXT_SECONDARY,
             fontsize=8,
         )
@@ -505,13 +562,27 @@ def render_arbitrage_gif(
     n_markets: int = 14,
     window: int = 18,
     seed: int = 42,
+    kalshi_tape: Optional[np.ndarray] = None,
+    poly_tape: Optional[np.ndarray] = None,
+    market_labels: Optional[Sequence[str]] = None,
+    data_source: Optional[str] = None,
 ) -> str:
     """Convenience wrapper used by the server and CLI.
 
-    ``opportunities`` may be ``ArbitrageOpportunity`` instances, plain
-    ``ArbPoint`` instances, or dicts with the keys ``kalshi_yes``,
-    ``poly_yes`` and ``net_profit_pct``. Anything we cannot interpret
-    is skipped so the surfaces still render.
+    Real‑data path: pass ``kalshi_tape`` and ``poly_tape`` as 2D
+    arrays ``(N_markets, frames + window)`` of YES prices recorded
+    across successive scans, plus ``market_labels`` for the
+    annotation. The surfaces will then visualise actual cross-venue
+    price evolution rather than the synthetic placeholder.
+
+    Demo path: omit the tapes and a deterministic synthetic surface
+    is rendered (used for the committed README asset and for the
+    very first server render before any scan history exists).
+
+    ``opportunities`` (optional) may be ``ArbitrageOpportunity``
+    instances, ``ArbPoint`` instances, or dicts with the keys
+    ``kalshi_yes``, ``poly_yes`` and ``net_profit_pct``. Anything we
+    cannot interpret is skipped so the surfaces still render.
     """
     points: List[ArbPoint] = []
     for opp in opportunities or []:
@@ -535,6 +606,10 @@ def render_arbitrage_gif(
         if projected is not None:
             points.append(projected)
 
+    using_real = kalshi_tape is not None and poly_tape is not None
+    if data_source is None:
+        data_source = "live" if using_real else "synthetic"
+
     renderer = ArbitrageSurfaceRenderer(
         n_markets=n_markets,
         window=window,
@@ -542,6 +617,10 @@ def render_arbitrage_gif(
         seed=seed,
         fee_pct=fee_pct,
         slippage_pct=slippage_pct,
+        kalshi_tape=kalshi_tape,
+        poly_tape=poly_tape,
+        market_labels=market_labels,
+        data_source=data_source,
     )
     return renderer.render(output_path, points=points, fps=fps)
 
