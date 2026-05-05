@@ -20,6 +20,10 @@ Every actionable arbitrage on the "now" edge is marked with:
 
 The camera is fixed; the surfaces themselves scroll forward in time so each frame represents the latest tape from both venues. Where the ribbons hug each other there is no arbitrage; where they pull apart, the markers light up.
 
+### Live data vs. demo
+
+The renderer reads from a **rolling YES‑price tape** (`PriceTapeBuffer`) that the server appends to on **every** market scan. Once the first scan completes, the GIF is regenerated from real Kalshi and Polymarket prices — the footer of the plot reads **`data: live`** in that case, and **`data: synthetic`** for the pre‑shipped demo asset above. The buffer holds the last 48 snapshots per market (≈ 14 markets × 48 ticks). Until enough scans have accumulated, the leftmost (oldest) part of the tape is left‑padded with the first observed value, so the visualisation is usable from scan #1.
+
 <p align="center">
   <img src="frontend/assets/arbitrage_surface.gif" alt="Live Kalshi vs Polymarket YES price surfaces" width="640">
 </p>
