@@ -12,11 +12,23 @@ from dotenv import load_dotenv
 
 @dataclass
 class KalshiConfig:
-    """Kalshi API configuration"""
+    """Kalshi API configuration.
+
+    The current Kalshi API requires RSA-PSS-SHA256 signing. Either
+    point ``private_key_path`` at a PEM file or set
+    ``private_key_pem`` to the inline PEM contents (e.g. when storing
+    the secret in a vault that materialises env vars at runtime).
+    The legacy ``api_secret`` HMAC field is retained only for tests
+    that mock the auth flow; production deployments should leave it
+    unset.
+    """
     api_key: Optional[str] = None
     api_secret: Optional[str] = None
-    api_url: str = "https://trading-api.kalshi.com/trade-api/v2"
+    api_url: str = "https://api.elections.kalshi.com/trade-api/v2"
     demo_mode: bool = False
+    private_key_path: Optional[str] = None
+    private_key_pem: Optional[str] = None
+    private_key_password: Optional[str] = None
 
 
 @dataclass
@@ -85,7 +97,10 @@ class Config:
                 api_key=os.getenv("KALSHI_API_KEY"),
                 api_secret=os.getenv("KALSHI_API_SECRET"),
                 api_url=os.getenv("KALSHI_API_URL", KalshiConfig.api_url),
-                demo_mode=os.getenv("KALSHI_DEMO_MODE", "false").lower() == "true"
+                demo_mode=os.getenv("KALSHI_DEMO_MODE", "false").lower() == "true",
+                private_key_path=os.getenv("KALSHI_PRIVATE_KEY_PATH"),
+                private_key_pem=os.getenv("KALSHI_PRIVATE_KEY_PEM"),
+                private_key_password=os.getenv("KALSHI_PRIVATE_KEY_PASSWORD"),
             ),
             polymarket=PolymarketConfig(
                 api_url=os.getenv("POLYMARKET_API_URL", PolymarketConfig.api_url),
@@ -120,6 +135,9 @@ class Config:
                 "api_url": self.kalshi.api_url,
                 "demo_mode": self.kalshi.demo_mode,
                 "has_api_key": bool(self.kalshi.api_key),
+                "has_private_key": bool(
+                    self.kalshi.private_key_pem or self.kalshi.private_key_path
+                ),
             },
             "polymarket": {
                 "api_url": self.polymarket.api_url,
